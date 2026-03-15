@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 24
+names: ['auto', 'barrier', 'bench', 'bike', 'bollard', 'car', 'construction_cone', 'drain_cover', 'fallen_branch', 'manhole_cover', 'parked_bicycle', 'parked_scooter', 'person', 'pole', 'pothole', 'richshaw', 'ricksaw', 'rickshaw', 'scooter', 'sign_post', 'step', 'tree', 'tree_trunk', 'truck']
+
+roboflow:
+  workspace: fdip
+  project: terrainsense
+  version: 2
+  license: MIT
+  url: https://universe.roboflow.com/fdip/terrainsense/dataset/2

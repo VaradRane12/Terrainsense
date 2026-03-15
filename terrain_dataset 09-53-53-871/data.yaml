@@ -1,0 +1,12 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 17
+names : ["pothole","person", "vehicle", "obstacle"]
+roboflow:
+  workspace: fdip
+  project: terrainsense
+  version: 3
+  license: MIT
+  url: https://universe.roboflow.com/fdip/terrainsense/dataset/3
