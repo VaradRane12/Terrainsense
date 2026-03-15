@@ -3,12 +3,12 @@ from ultralytics import YOLO
 model = YOLO("yolov8n.pt")
 
 model.train(
-    data="terrain_dataset/data.yaml",
-    epochs=200,
+    data="terrain_dataset/data.yaml", 
+    epochs=100,
     imgsz=640,
-    batch=16,
-
-    device="mps",   # Apple Silicon GPU
+    batch=64,
+    device="mps",
+    workers=8,
 
     mosaic=1.0,
     mixup=0.2,
