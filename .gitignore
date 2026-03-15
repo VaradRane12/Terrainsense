@@ -1,1 +1,9 @@
 .venv
+Sidewalk-Hazard-Detection-Using-a-Variational-Autoencoder-and-One-Class-SVM
+SVM_Training
+VAE_Training
+__pycache__
+SVM.zip
+VAE.zip
+.DS_Store
+__MACOSX
