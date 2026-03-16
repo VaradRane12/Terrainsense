@@ -8,3 +8,10 @@ VAE.zip
 .DS_Store
 __MACOSX
 Yolo_model/walk_test.mp4
+*.pth
+*.pt
+*.mp4
+runs/
+weights/
+terrain_dataset 09-53-53-871
+Terrainsense_commands.docx
