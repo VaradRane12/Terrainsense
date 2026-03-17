@@ -1,34 +1,19 @@
-"""
-Smart Batch Sampler
-Picks ~300 diverse, high-value frames for your first labeling round.
-
-Strategy:
-  1. Spread evenly across all 3 clips (temporal diversity)
-  2. Bias toward low-confidence frames (model was unsure = more learning signal)
-  3. Within each clip, space samples out (avoid near-duplicate scenes)
-
-Usage: python 5_sample_batch.py
-"""
-
 import os
 import shutil
 from pathlib import Path
 from collections import defaultdict
 
-# ── CONFIG ────────────────────────────────────────────────
-PRIORITY_DIR  = "review/priority"   # low-confidence frames
-NORMAL_DIR    = "review/normal"     # high-confidence frames
+PRIORITY_DIR  = "review/priority"   
+NORMAL_DIR    = "review/normal"     
 LABELS_DIR    = "data/pseudo_labels"
 CLASSES_FILE  = "classes.txt"
 BATCH_DIR     = "review/batch1"
 
 TARGET_TOTAL      = 300
-PRIORITY_RATIO    = 0.70   # 70% from low-confidence, 30% from normal
-# ─────────────────────────────────────────────────────────
+PRIORITY_RATIO    = 0.70  
 
 
 def sample_evenly(frames: list, n: int) -> list:
-    """Pick n evenly-spaced frames from a list."""
     if len(frames) <= n:
         return frames
     step = len(frames) / n
@@ -38,7 +23,6 @@ def sample_evenly(frames: list, n: int) -> list:
 def group_by_clip(frames: list) -> dict:
     by_clip = defaultdict(list)
     for f in frames:
-        # stem like "clip1_00042" → key "clip1"
         parts = Path(f).stem.split("_")
         clip_key = parts[0] if parts else "unknown"
         by_clip[clip_key].append(f)
@@ -59,7 +43,6 @@ def sample_batch(priority_dir, normal_dir, labels_dir, batch_dir, target, priori
 
     sampled = []
 
-    # ── Sample from priority (spread across clips) ─────────────────────
     by_clip = group_by_clip(priority_frames)
     per_clip = n_priority // max(len(by_clip), 1)
     for clip, clip_frames in sorted(by_clip.items()):
@@ -67,7 +50,6 @@ def sample_batch(priority_dir, normal_dir, labels_dir, batch_dir, target, priori
         sampled.extend(picked)
         print(f"  {clip}: picked {len(picked)} / {len(clip_frames)} priority frames")
 
-    # ── Top up with normal frames if needed ────────────────────────────
     by_clip_n = group_by_clip(normal_frames)
     per_clip_n = n_normal // max(len(by_clip_n), 1)
     for clip, clip_frames in sorted(by_clip_n.items()):
@@ -75,7 +57,6 @@ def sample_batch(priority_dir, normal_dir, labels_dir, batch_dir, target, priori
         sampled.extend(picked)
         print(f"  {clip}: picked {len(picked)} / {len(clip_frames)} normal frames")
 
-    # ── Copy frames + labels into batch dir ────────────────────────────
     copied = 0
     for f in sampled:
         f = Path(f)
