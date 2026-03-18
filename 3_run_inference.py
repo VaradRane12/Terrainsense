@@ -15,12 +15,12 @@ from pathlib import Path
 from ultralytics import YOLO
 
 # ── CONFIG ────────────────────────────────────────────────
-MODEL_PATH      = "best.pt"   # path to your .pt file
+MODEL_PATH      = "/Users/varad/Documents/Programming /Terrainsense/runs/detect/train9/weights/best.pt"   # path to your .pt file
 FRAMES_DIR      = "data/deduped_frames"
 LABELS_DIR      = "data/pseudo_labels"      # YOLO .txt files go here
 CONF_THRESHOLD  = 0.25   # minimum confidence to save a detection
 FLAG_THRESHOLD  = 0.50   # frames where max confidence < this → flagged for priority review
-FLAGGED_LIST    = "data/priority_review.txt"
+FLAGGED_LIST    = "data/priority_review_rerun.txt"
 # ─────────────────────────────────────────────────────────
 
 

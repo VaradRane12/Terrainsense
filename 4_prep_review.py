@@ -19,8 +19,8 @@ from pathlib import Path
 # ── CONFIG ────────────────────────────────────────────────
 FRAMES_DIR    = "data/deduped_frames"
 LABELS_DIR    = "data/pseudo_labels"
-FLAGGED_LIST  = "data/priority_review.txt"
-REVIEW_ROOT   = "review"
+FLAGGED_LIST  = "data/priority_review_rerun.txt"
+REVIEW_ROOT   = "review_rerun"
 CLASSES_FILE  = "classes.txt"   # must exist — one class name per line
 # ─────────────────────────────────────────────────────────
 

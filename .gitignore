@@ -2,3 +2,5 @@ data/
 *.mp4
 review/
 terrain_dataset/
+review_rerun
+terrain_dataset copy
