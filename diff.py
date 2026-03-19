@@ -5,7 +5,7 @@ from ultralytics import YOLO
 model = YOLO("yolov8n.pt")
 
 # Phone camera stream
-url = "http://192.168.29.56:8080/video"
+url = "http://192.168.1.9:8080/video"
 cap = cv2.VideoCapture(url)
 
 # Get frame size
