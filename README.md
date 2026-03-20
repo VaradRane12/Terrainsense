@@ -46,6 +46,12 @@ Then open labelImg and start with the priority batch:
 labelImg review/priority/
 ```
 
+After reviewing, run the final two steps:
+```bash
+python 5_sample_batch.py         # (first retraining run only) — builds a sample batch to seed the model
+python 6_retrain.py              # retrains on combined old + newly reviewed data
+```
+
 ### Utility & maintenance scripts
 ```bash
 python bugfix_labelfix_roboflow.py   # fix Roboflow polygon exports → YOLO bounding boxes
@@ -53,12 +59,6 @@ python datasetcheck.py               # validate label format (4-value YOLO boxes
 python merge_dataset.py              # merge reviewed labels into main training data
 python priority_rerun_tolabel-studio.py  # convert YOLO labels → Label Studio JSON
 python removing_samplebatch.py       # remove first sample-batch frames before retraining
-```
-
-### Retraining
-```bash
-# After merging reviewed data:
-python train.py --weights weights/your_model.pt --data data.yaml
 ```
 
 ---
@@ -73,6 +73,8 @@ python train.py --weights weights/your_model.pt --data data.yaml
 | 2 | `2_deduplicate.py` | `data/raw_frames/` | `data/deduped_frames/` | Perceptual hash dedup |
 | 3 | `3_run_inference.py` | `data/deduped_frames/` | `data/pseudo_labels/`, `priority_review.txt` | Flags low-confidence frames |
 | 4 | `4_prep_review.py` | `priority_review.txt` | `review/priority/`, `review/normal/` | Organises batches for labelImg |
+| 5 | `5_sample_batch.py` | reviewed frames + labels | sample batch for training | **First retraining run only.** Builds the initial sample batch to give the model its first round of real labels. After this run, execute `removing_samplebatch.py` so these frames don't recur. |
+| 6 | `6_retrain.py` | `data/images/train/`, `data/labels/train/` | updated `weights/` | Retrains on all old + newly reviewed data. Re-run after every review cycle with the latest weights. |
 
 ### Utility scripts
 
