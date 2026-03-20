@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 # -------- paths --------
-mixed_folder = "review/batch1"          # folder with images + labels
+mixed_folder = "review_rerun2/normal"          # folder with images + labels
 dataset_root = "terrain_dataset"       # final dataset
 
 train_ratio = 0.8

@@ -17,10 +17,10 @@ import shutil
 from pathlib import Path
 
 # ── CONFIG ────────────────────────────────────────────────
-FRAMES_DIR    = "data/deduped_frames"
-LABELS_DIR    = "data/pseudo_labels"
-FLAGGED_LIST  = "data/priority_review_rerun.txt"
-REVIEW_ROOT   = "review_rerun"
+FRAMES_DIR    = "review_rerun/normal"
+LABELS_DIR    = "review_rerun/normal"
+FLAGGED_LIST  = "data/priority_review_rerun2.txt"
+REVIEW_ROOT   = "review_rerun2"
 CLASSES_FILE  = "classes.txt"   # must exist — one class name per line
 # ─────────────────────────────────────────────────────────
 
