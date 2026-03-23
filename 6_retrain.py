@@ -1,6 +1,6 @@
 from ultralytics import YOLO
 
-model = YOLO("/Users/varad/Documents/Programming /Terrainsense/runs/detect/train9/weights/best.pt")
+model = YOLO("/Users/varad/Documents/Programming /Terrainsense/runs/detect/train10/weights/best.pt")
 
 model.train(
     data="terrain_dataset/data.yaml",
