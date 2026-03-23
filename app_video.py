@@ -1,204 +1,150 @@
 import cv2
 import numpy as np
-import time
 import threading
-from tflite_runtime.interpreter import Interpreter
-from flask import Flask, Response, jsonify
+from flask import Flask, Response
+import tensorflow as tf
 
-# ── CONFIG ─────────────────────────────────────
-MODEL_PATH   = "best_int8.tflite"
-VIDEO_PATH   = 0
-CONF_THRESH  = 0.5
-TOP_K        = 10
-NUM_THREADS  = 4
-JPEG_QUALITY = 55
-FRAME_SCALE  = 0.5
+app = Flask(__name__)
 
-cv2.setNumThreads(2)
-cv2.setUseOptimized(True)
+# -------------------- LOAD MODEL --------------------
+interpreter = tf.lite.Interpreter(model_path="model.tflite")
+interpreter.allocate_tensors()
 
-# ── LOAD MODEL ─────────────────────────────────
-interp = Interpreter(MODEL_PATH, num_threads=NUM_THREADS)
-interp.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
-inp = interp.get_input_details()[0]
-out = interp.get_output_details()[0]
+INPUT_SIZE = input_details[0]['shape'][1]
 
-INPUT_H = inp['shape'][2]
-INPUT_W = inp['shape'][3]
+# -------------------- GLOBAL FRAME --------------------
+frame_lock = threading.Lock()
+output_frame = None
 
-IN_SCALE, IN_ZERO   = inp['quantization']
-OUT_SCALE, OUT_ZERO = out['quantization']
+# -------------------- NMS --------------------
+def nms(boxes, scores, iou_threshold=0.5):
+    idxs = np.argsort(scores)[::-1]
+    keep = []
 
-IN_IDX  = inp['index']
-OUT_IDX = out['index']
+    while len(idxs) > 0:
+        i = idxs[0]
+        keep.append(i)
 
-# buffers (reuse memory)
-infer_buf = np.empty((1, 3, INPUT_H, INPUT_W), dtype=np.int8)
-float_buf = np.empty((INPUT_H, INPUT_W, 3), dtype=np.float32)
+        if len(idxs) == 1:
+            break
 
-print("Input:", inp['shape'], inp['dtype'])
-print("Output:", out['shape'])
+        rest = idxs[1:]
 
-# ── SHARED STATE ───────────────────────────────
-latest_jpeg = None
-latest_fps  = 0.0
-latest_dets = 0
-lock = threading.Lock()
+        xx1 = np.maximum(boxes[i][0], boxes[rest][:, 0])
+        yy1 = np.maximum(boxes[i][1], boxes[rest][:, 1])
+        xx2 = np.minimum(boxes[i][2], boxes[rest][:, 2])
+        yy2 = np.minimum(boxes[i][3], boxes[rest][:, 3])
 
-# ── FAST SIGMOID LUT ───────────────────────────
-_SIG_X   = np.linspace(-10, 10, 1024)
-_SIG_LUT = 1.0 / (1.0 + np.exp(-_SIG_X))
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
 
-def fast_sigmoid(x):
-    return np.interp(x, _SIG_X, _SIG_LUT)
+        inter = w * h
+        area1 = (boxes[i][2]-boxes[i][0]) * (boxes[i][3]-boxes[i][1])
+        area2 = (boxes[rest][:,2]-boxes[rest][:,0]) * (boxes[rest][:,3]-boxes[rest][:,1])
 
-# ── MAIN LOOP ──────────────────────────────────
-def loop():
-    global latest_jpeg, latest_fps, latest_dets
+        iou = inter / (area1 + area2 - inter + 1e-6)
 
-    cap = cv2.VideoCapture(VIDEO_PATH)
+        idxs = idxs[1:][iou < iou_threshold]
 
-    # force lower resolution (important)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    return keep
 
-    if not cap.isOpened():
-        raise RuntimeError("Camera failed")
+# -------------------- INFERENCE THREAD --------------------
+def camera_loop():
+    global output_frame
 
-    times = []
+    cap = cv2.VideoCapture(0)
 
     while True:
-        t0 = time.time()
-
         ret, frame = cap.read()
         if not ret:
             continue
 
-        h, w = frame.shape[:2]
+        h, w, _ = frame.shape
 
-        # ── PREPROCESS (no allocations) ─────────
-        cv2.resize(frame, (INPUT_W, INPUT_H),
-                   dst=float_buf,
-                   interpolation=cv2.INTER_NEAREST)
+        # preprocess
+        img = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE))
+        img = img.astype(np.float32) / 255.0
+        img = np.expand_dims(img, axis=0)
 
-        float_buf /= 255.0
+        # inference
+        interpreter.set_tensor(input_details[0]['index'], img)
+        interpreter.invoke()
+        output = interpreter.get_tensor(output_details[0]['index'])[0]
 
-        img = np.transpose(float_buf, (2, 0, 1))
-        img = (img / IN_SCALE + IN_ZERO).astype(np.int8)
+        # decode
+        output = output.T  # (2100, 8)
 
-        infer_buf[0] = img
+        boxes = output[:, :4]
+        obj = output[:, 4]
+        class_probs = output[:, 5:]
 
-        # ── INFERENCE ──────────────────────────
-        interp.set_tensor(IN_IDX, infer_buf)
-        interp.invoke()
-        output = interp.get_tensor(OUT_IDX)
+        scores = obj[:, None] * class_probs
+        class_ids = np.argmax(scores, axis=1)
+        conf = np.max(scores, axis=1)
 
-        output = (output.astype(np.float32) - OUT_ZERO) * OUT_SCALE
+        mask = conf > 0.4
 
-        preds = output[0].T  # (2100, 8)
+        boxes = boxes[mask]
+        class_ids = class_ids[mask]
+        conf = conf[mask]
 
-        boxes = preds[:, :4]
-        scores_raw = preds[:, 4:]
-
-        # ── FAST TOP-K FILTER (no full sigmoid) ─
-        top_idx = np.argsort(-scores_raw.max(axis=1))[:TOP_K]
-
-        dets = 0
-
-        for i in top_idx:
-            raw = scores_raw[i]
-
-            # quick reject
-            if raw.max() < 0:
-                continue
-
-            probs = fast_sigmoid(raw)
-
-            conf = probs.max()
-            if conf < CONF_THRESH:
-                continue
-
-            x, y, bw, bh = boxes[i]
-
+        # convert boxes (xywh → xyxy)
+        boxes_xyxy = []
+        for b in boxes:
+            x, y, bw, bh = b
             x1 = int((x - bw/2) * w)
             y1 = int((y - bh/2) * h)
             x2 = int((x + bw/2) * w)
             y2 = int((y + bh/2) * h)
+            boxes_xyxy.append([x1, y1, x2, y2])
 
-            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+        if len(boxes_xyxy) > 0:
+            boxes_xyxy = np.array(boxes_xyxy)
+            keep = nms(boxes_xyxy, conf)
 
-            dets += 1
+            for i in keep:
+                x1, y1, x2, y2 = boxes_xyxy[i]
+                label = f"{class_ids[i]} {conf[i]:.2f}"
 
-        # ── FPS ────────────────────────────────
-        times.append(time.time() - t0)
-        if len(times) > 20:
-            times.pop(0)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+                cv2.putText(frame, label, (x1, y1-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
 
-        fps = 1.0 / (sum(times)/len(times))
+        # update global frame
+        with frame_lock:
+            output_frame = frame.copy()
 
-        cv2.putText(frame, f"FPS:{fps:.1f} D:{dets}",
-                    (10,30), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (0,255,0), 2)
+# -------------------- STREAM --------------------
+def generate():
+    global output_frame
 
-        # ── DOWNSCALE ─────────────────────────
-        if FRAME_SCALE != 1.0:
-            frame = cv2.resize(frame,
-                               (int(w*FRAME_SCALE), int(h*FRAME_SCALE)),
-                               interpolation=cv2.INTER_NEAREST)
-
-        # ── SKIP ENCODE IF NO DETECTIONS ───────
-        if dets == 0 and latest_jpeg is not None:
-            continue
-
-        # ── JPEG ──────────────────────────────
-        _, buf = cv2.imencode(".jpg", frame,
-                              [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-
-        with lock:
-            latest_jpeg = buf.tobytes()
-            latest_fps  = fps
-            latest_dets = dets
-
-
-# ── FLASK ─────────────────────────────────────
-app = Flask(__name__)
-
-def stream():
-    last = None
     while True:
-        with lock:
-            jpg = latest_jpeg
+        with frame_lock:
+            if output_frame is None:
+                continue
+            _, buffer = cv2.imencode('.jpg', output_frame)
+            frame = buffer.tobytes()
 
-        if jpg is None or jpg is last:
-            time.sleep(0.001)
-            continue
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-        last = jpg
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
-               jpg + b'\r\n')
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(stream(),
-        mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/stats')
-def stats():
-    with lock:
-        return jsonify(fps=round(latest_fps,1),
-                       dets=latest_dets)
-
+# -------------------- ROUTES --------------------
 @app.route('/')
 def index():
-    return "<img src='/video_feed'>"
+    return "<img src='/video'>"
 
-# ── MAIN ──────────────────────────────────────
+@app.route('/video')
+def video():
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# -------------------- MAIN --------------------
 if __name__ == "__main__":
-    t = threading.Thread(target=loop, daemon=True)
+    t = threading.Thread(target=camera_loop, daemon=True)
     t.start()
 
-    while latest_jpeg is None:
-        time.sleep(0.1)
-
+    print("Flask running on http://<pi-ip>:5000")
     app.run(host="0.0.0.0", port=5000, threaded=True)
