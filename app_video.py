@@ -1,89 +1,114 @@
 import cv2
 import numpy as np
 import threading
+import time
 from flask import Flask, Response
-import tensorflow as tf
+from tflite_runtime.interpreter import Interpreter
 
 app = Flask(__name__)
 
 # -------------------- LOAD MODEL --------------------
-interpreter = tf.lite.Interpreter(model_path="model.tflite")
+interpreter = Interpreter(model_path="model.tflite")
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-INPUT_SIZE = input_details[0]['shape'][1]
+input_index = input_details[0]['index']
+output_index = output_details[0]['index']
+
+INPUT_SIZE = 256  # reduced from 320 for speed
 
 # -------------------- GLOBAL FRAME --------------------
 frame_lock = threading.Lock()
 output_frame = None
 
-# -------------------- NMS --------------------
-def nms(boxes, scores, iou_threshold=0.5):
-    idxs = np.argsort(scores)[::-1]
-    keep = []
-
-    while len(idxs) > 0:
-        i = idxs[0]
-        keep.append(i)
-
-        if len(idxs) == 1:
-            break
-
-        rest = idxs[1:]
-
-        xx1 = np.maximum(boxes[i][0], boxes[rest][:, 0])
-        yy1 = np.maximum(boxes[i][1], boxes[rest][:, 1])
-        xx2 = np.minimum(boxes[i][2], boxes[rest][:, 2])
-        yy2 = np.minimum(boxes[i][3], boxes[rest][:, 3])
-
-        w = np.maximum(0, xx2 - xx1)
-        h = np.maximum(0, yy2 - yy1)
-
-        inter = w * h
-        area1 = (boxes[i][2]-boxes[i][0]) * (boxes[i][3]-boxes[i][1])
-        area2 = (boxes[rest][:,2]-boxes[rest][:,0]) * (boxes[rest][:,3]-boxes[rest][:,1])
-
-        iou = inter / (area1 + area2 - inter + 1e-6)
-
-        idxs = idxs[1:][iou < iou_threshold]
-
-    return keep
-
 # -------------------- INFERENCE THREAD --------------------
 def camera_loop():
     global output_frame
 
-    cap = cv2.VideoCapture("walk_test.mp4")  # <-- CHANGE HER E 
+    cap = cv2.VideoCapture("walk_test.mp4")  # change if needed
 
     if not cap.isOpened():
         print("Video failed to open")
         return
 
+    frame_count = 0
+
     while True:
         ret, frame = cap.read()
 
         if not ret:
-            print("Video ended, restarting...")
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+
+        frame_count += 1
+
+        # -------- SKIP EVERY 2ND FRAME --------
+        if frame_count % 2 != 0:
+            with frame_lock:
+                output_frame = frame.copy()
             continue
 
         h, w, _ = frame.shape
 
-        # preprocess
+        # -------- PREPROCESS --------
         img = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE))
         img = img.astype(np.float32) / 255.0
         img = np.expand_dims(img, axis=0)
 
-        # inference
-        interpreter.set_tensor(input_details[0]['index'], img)
+        # -------- INFERENCE --------
+        interpreter.set_tensor(input_index, img)
         interpreter.invoke()
-        output = interpreter.get_tensor(output_details[0]['index'])[0]
+        output = interpreter.get_tensor(output_index)[0]
 
-        # (skip detection for now to debug stream)
+        output = output.T  # (N, 8)
+
+        boxes = output[:, :4]
+        obj = output[:, 4]
+        class_probs = output[:, 5:]
+
+        scores = obj[:, None] * class_probs
+        class_ids = np.argmax(scores, axis=1)
+        conf = np.max(scores, axis=1)
+
+        mask = conf > 0.4
+        boxes = boxes[mask]
+        conf = conf[mask]
+        class_ids = class_ids[mask]
+
+        boxes_xyxy = []
+
+        for b in boxes:
+            x, y, bw, bh = b
+            x1 = int((x - bw/2) * w)
+            y1 = int((y - bh/2) * h)
+            x2 = int((x + bw/2) * w)
+            y2 = int((y + bh/2) * h)
+            boxes_xyxy.append([x1, y1, x2, y2])
+
+        # -------- FAST NMS --------
+        if len(boxes_xyxy) > 0:
+            indices = cv2.dnn.NMSBoxes(
+                boxes_xyxy,
+                conf.tolist(),
+                score_threshold=0.4,
+                nms_threshold=0.5
+            )
+
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x1, y1, x2, y2 = boxes_xyxy[i]
+                    label = f"{class_ids[i]} {conf[i]:.2f}"
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+                    cv2.putText(frame, label, (x1, y1-5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+        # -------- OUTPUT --------
         with frame_lock:
             output_frame = frame.copy()
+
 # -------------------- STREAM --------------------
 def generate():
     global output_frame
@@ -91,17 +116,21 @@ def generate():
     while True:
         with frame_lock:
             if output_frame is None:
+                time.sleep(0.01)
                 continue
+
             _, buffer = cv2.imencode('.jpg', output_frame)
             frame = buffer.tobytes()
 
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
+        time.sleep(0.02)
+
 # -------------------- ROUTES --------------------
 @app.route('/')
 def index():
-    return "<img src='/video'>"
+    return "<h2>Video Stream</h2><img src='/video'>"
 
 @app.route('/video')
 def video():
@@ -113,5 +142,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=camera_loop, daemon=True)
     t.start()
 
-    print("Flask running on http://<pi-ip>:5000")
+    print("Running on http://<pi-ip>:5000/video")
     app.run(host="0.0.0.0", port=5000, threaded=True)
