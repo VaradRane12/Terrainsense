@@ -1,7 +1,23 @@
-vl53l5cx-python/
+# Ignore virtual environments
+.venv/
+venv_system/
+
+# Ignore datasets (all variants)
+terrain_dataset/
+terrain_dataset*/
+data/
+
+# Ignore review folders
+review/
+review_rerun/
+review_rerun*/
+
+# Ignore video files
 *.mp4
 *.avi
-.venv
-venv_system
 
+# Ignore macOS junk
+.DS_Store
 
+# Ignore submodule / external repo
+vl53l5cx-python/
