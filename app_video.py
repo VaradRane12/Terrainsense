@@ -55,7 +55,7 @@ def nms(boxes, scores, iou_threshold=0.5):
 def camera_loop():
     global output_frame
 
-    cap = cv2.VideoCapture("walk_test.mp4")  # <-- CHANGE HERE
+    cap = cv2.VideoCapture("walk_test.mp4")  # <-- CHANGE HER E 
 
     if not cap.isOpened():
         print("Video failed to open")
