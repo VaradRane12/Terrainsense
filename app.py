@@ -1,13 +1,13 @@
 from flask import Flask, Response
 import cv2
 import numpy as np
-import onnxruntime as ort
+from tflite_runtime.interpreter import Interpreter
 import time
 
 app = Flask(__name__)
 
 VIDEO_PATH  = "walk_test.mp4"
-MODEL_PATH  = "best.onnx"
+MODEL_PATH  = "model.tflite"
 INPUT_SIZE  = 320
 CONF_THRESH = 0.50
 NMS_THRESH  = 0.30
@@ -22,18 +22,57 @@ CLASS_LABELS = {
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
-print("[INFO] Loading model...")
-session    = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
-input_name = session.get_inputs()[0].name
-print("[INFO] Model loaded!")
+# ───────────────────────────────────────────────
+#  LOAD TFLITE MODEL
+# ───────────────────────────────────────────────
+print("[INFO] Loading TFLite model...")
+interpreter = Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
 
+input_details  = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+input_dtype    = input_details[0]['dtype']
+print(f"[INFO] Model input dtype: {input_dtype}")
+print("[INFO] ✅ TFLite model loaded!")
+
+# ───────────────────────────────────────────────
+#  PREPROCESS
+# ───────────────────────────────────────────────
 def preprocess(frame):
     img = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32) / 255.0
-    img = img.transpose(2, 0, 1)
-    return np.expand_dims(img, axis=0)
+    img = img.transpose(2, 0, 1)              # HWC → CHW
+    img = np.expand_dims(img, axis=0)         # add batch dim
 
+    # Handle quantized models
+    if input_dtype == np.int8:
+        scale, zero_point = input_details[0]['quantization']
+        img = (img / scale + zero_point).astype(np.int8)
+    elif input_dtype == np.uint8:
+        img = (img * 255).astype(np.uint8)
+
+    return img
+
+# ───────────────────────────────────────────────
+#  RUN TFLITE INFERENCE
+# ───────────────────────────────────────────────
+def run_inference(frame):
+    input_data = preprocess(frame)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    output = interpreter.get_tensor(output_details[0]['index'])
+
+    # Dequantize if INT8
+    if output_details[0]['dtype'] == np.int8:
+        scale, zero_point = output_details[0]['quantization']
+        output = (output.astype(np.float32) - zero_point) * scale
+
+    return [output]
+
+# ───────────────────────────────────────────────
+#  POSTPROCESS
+# ───────────────────────────────────────────────
 def postprocess(output, frame):
     h_frame, w_frame = frame.shape[:2]
     preds        = output[0].squeeze(0).T
@@ -71,6 +110,9 @@ def postprocess(output, frame):
     cv2.putText(frame, text, (x1+4, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
     return label, color, conf
 
+# ───────────────────────────────────────────────
+#  FRAME GENERATOR
+# ───────────────────────────────────────────────
 def generate_frames():
     cap      = cv2.VideoCapture(VIDEO_PATH)
     fps_list = []
@@ -81,7 +123,7 @@ def generate_frames():
             continue
         h, w, _ = frame.shape
         t1     = time.time()
-        output = session.run(None, {input_name: preprocess(frame)})
+        output = run_inference(frame)
         t2     = time.time()
         fps = 1.0 / (t2 - t1 + 1e-6)
         fps_list.append(fps)
@@ -95,6 +137,9 @@ def generate_frames():
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
     cap.release()
 
+# ───────────────────────────────────────────────
+#  FLASK ROUTES
+# ───────────────────────────────────────────────
 @app.route('/')
 def index():
     return (
