@@ -9,7 +9,7 @@ from flask import Flask, Response, jsonify
 MODEL_PATH   = "best_int8.tflite"
 VIDEO_PATH   = 0
 CONF_THRESH  = 0.5
-TOP_K        = 20
+TOP_K        = 10
 NUM_THREADS  = 4
 JPEG_QUALITY = 55
 FRAME_SCALE  = 0.5
@@ -33,8 +33,9 @@ OUT_SCALE, OUT_ZERO = out['quantization']
 IN_IDX  = inp['index']
 OUT_IDX = out['index']
 
-# INT8 buffer (correct)
+# buffers (reuse memory)
 infer_buf = np.empty((1, 3, INPUT_H, INPUT_W), dtype=np.int8)
+float_buf = np.empty((INPUT_H, INPUT_W, 3), dtype=np.float32)
 
 print("Input:", inp['shape'], inp['dtype'])
 print("Output:", out['shape'])
@@ -52,13 +53,18 @@ _SIG_LUT = 1.0 / (1.0 + np.exp(-_SIG_X))
 def fast_sigmoid(x):
     return np.interp(x, _SIG_X, _SIG_LUT)
 
-# ── INFERENCE LOOP ─────────────────────────────
+# ── MAIN LOOP ──────────────────────────────────
 def loop():
     global latest_jpeg, latest_fps, latest_dets
 
     cap = cv2.VideoCapture(VIDEO_PATH)
+
+    # force lower resolution (important)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
     if not cap.isOpened():
-        raise RuntimeError("Camera/Video failed")
+        raise RuntimeError("Camera failed")
 
     times = []
 
@@ -71,62 +77,58 @@ def loop():
 
         h, w = frame.shape[:2]
 
-        # ── PREPROCESS (INT8 + NCHW) ────────────
-        resized = cv2.resize(frame, (INPUT_W, INPUT_H),
-                             interpolation=cv2.INTER_NEAREST)
+        # ── PREPROCESS (no allocations) ─────────
+        cv2.resize(frame, (INPUT_W, INPUT_H),
+                   dst=float_buf,
+                   interpolation=cv2.INTER_NEAREST)
 
-        img = resized.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
+        float_buf /= 255.0
+
+        img = np.transpose(float_buf, (2, 0, 1))
         img = (img / IN_SCALE + IN_ZERO).astype(np.int8)
 
         infer_buf[0] = img
 
-        # ── INFERENCE ───────────────────────────
+        # ── INFERENCE ──────────────────────────
         interp.set_tensor(IN_IDX, infer_buf)
         interp.invoke()
         output = interp.get_tensor(OUT_IDX)
 
-        # dequantize
         output = (output.astype(np.float32) - OUT_ZERO) * OUT_SCALE
 
-        # ── POSTPROCESS (NO NMS) ────────────────
-        preds = output[0]           # (8, 2100)
-        preds = preds.T             # (2100, 8)
+        preds = output[0].T  # (2100, 8)
 
         boxes = preds[:, :4]
         scores_raw = preds[:, 4:]
 
-        # filter BEFORE sigmoid
-        max_logit = scores_raw.max(axis=1)
-        mask = max_logit > 0
+        # ── FAST TOP-K FILTER (no full sigmoid) ─
+        top_idx = np.argsort(-scores_raw.max(axis=1))[:TOP_K]
 
         dets = 0
 
-        if mask.any():
-            scores = fast_sigmoid(scores_raw[mask])
+        for i in top_idx:
+            raw = scores_raw[i]
 
-            conf = scores.max(axis=1)
-            cls  = scores.argmax(axis=1)
+            # quick reject
+            if raw.max() < 0:
+                continue
 
-            boxes = boxes[mask]
+            probs = fast_sigmoid(raw)
 
-            # TOP-K instead of NMS
-            idx = np.argsort(-conf)[:TOP_K]
+            conf = probs.max()
+            if conf < CONF_THRESH:
+                continue
 
-            for i in idx:
-                if conf[i] < CONF_THRESH:
-                    continue
+            x, y, bw, bh = boxes[i]
 
-                x, y, bw, bh = boxes[i]
+            x1 = int((x - bw/2) * w)
+            y1 = int((y - bh/2) * h)
+            x2 = int((x + bw/2) * w)
+            y2 = int((y + bh/2) * h)
 
-                x1 = int((x - bw/2) * w)
-                y1 = int((y - bh/2) * h)
-                x2 = int((x + bw/2) * w)
-                y2 = int((y + bh/2) * h)
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
 
-                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-
-                dets += 1
+            dets += 1
 
         # ── FPS ────────────────────────────────
         times.append(time.time() - t0)
@@ -144,6 +146,10 @@ def loop():
             frame = cv2.resize(frame,
                                (int(w*FRAME_SCALE), int(h*FRAME_SCALE)),
                                interpolation=cv2.INTER_NEAREST)
+
+        # ── SKIP ENCODE IF NO DETECTIONS ───────
+        if dets == 0 and latest_jpeg is not None:
+            continue
 
         # ── JPEG ──────────────────────────────
         _, buf = cv2.imencode(".jpg", frame,
@@ -165,7 +171,7 @@ def stream():
             jpg = latest_jpeg
 
         if jpg is None or jpg is last:
-            time.sleep(0.005)
+            time.sleep(0.001)
             continue
 
         last = jpg
