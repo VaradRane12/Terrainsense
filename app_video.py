@@ -55,11 +55,18 @@ def nms(boxes, scores, iou_threshold=0.5):
 def camera_loop():
     global output_frame
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture("walk_test.mp4")  # <-- CHANGE HERE
+
+    if not cap.isOpened():
+        print("Video failed to open")
+        return
 
     while True:
         ret, frame = cap.read()
+
         if not ret:
+            print("Video ended, restarting...")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             continue
 
         h, w, _ = frame.shape
@@ -74,49 +81,9 @@ def camera_loop():
         interpreter.invoke()
         output = interpreter.get_tensor(output_details[0]['index'])[0]
 
-        # decode
-        output = output.T  # (2100, 8)
-
-        boxes = output[:, :4]
-        obj = output[:, 4]
-        class_probs = output[:, 5:]
-
-        scores = obj[:, None] * class_probs
-        class_ids = np.argmax(scores, axis=1)
-        conf = np.max(scores, axis=1)
-
-        mask = conf > 0.4
-
-        boxes = boxes[mask]
-        class_ids = class_ids[mask]
-        conf = conf[mask]
-
-        # convert boxes (xywh → xyxy)
-        boxes_xyxy = []
-        for b in boxes:
-            x, y, bw, bh = b
-            x1 = int((x - bw/2) * w)
-            y1 = int((y - bh/2) * h)
-            x2 = int((x + bw/2) * w)
-            y2 = int((y + bh/2) * h)
-            boxes_xyxy.append([x1, y1, x2, y2])
-
-        if len(boxes_xyxy) > 0:
-            boxes_xyxy = np.array(boxes_xyxy)
-            keep = nms(boxes_xyxy, conf)
-
-            for i in keep:
-                x1, y1, x2, y2 = boxes_xyxy[i]
-                label = f"{class_ids[i]} {conf[i]:.2f}"
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
-                cv2.putText(frame, label, (x1, y1-5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
-
-        # update global frame
+        # (skip detection for now to debug stream)
         with frame_lock:
             output_frame = frame.copy()
-
 # -------------------- STREAM --------------------
 def generate():
     global output_frame
