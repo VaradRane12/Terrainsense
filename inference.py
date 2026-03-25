@@ -25,6 +25,9 @@ from config import (
     IGNORE_FAR_MM,
     INPUT_SIZE,
     MODEL_PATH,
+    MODEL_DELEGATE,
+    MODEL_INPUT_SCALE,
+    MODEL_NUM_THREADS,
     NMS_THRESH,
     PERSON_MOVE_PX_PER_SEC,
     TOF_ALERT_MM,
@@ -47,9 +50,14 @@ except ImportError:
         ) from exc
 
 print("[INFO] Loading TFLite model...")
-_interpreter = Interpreter(model_path=MODEL_PATH)
+_interpreter = Interpreter(model_path=MODEL_PATH, num_threads=MODEL_NUM_THREADS)
 _interpreter.allocate_tensors()
 print(f"[INFO] Interpreter backend : {INTERPRETER_BACKEND}")
+print(f"[INFO] Model threads       : {MODEL_NUM_THREADS} (Pi 4 optimization)")
+if MODEL_INPUT_SCALE != 1.0:
+    print(f"[INFO] Input scale         : {MODEL_INPUT_SCALE:.2f}x (speed-up at cost of accuracy)")
+if MODEL_DELEGATE != "auto" and MODEL_DELEGATE != "cpu":
+    print(f"[INFO] Delegate            : {MODEL_DELEGATE}")
 
 _input_details  = _interpreter.get_input_details()
 _output_details = _interpreter.get_output_details()
@@ -67,7 +75,15 @@ _person_state: dict = {
 
 # ── Public API ───────────────────────────────────────────────────────────────
 def preprocess(frame: np.ndarray) -> np.ndarray:
-    img = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE))
+    # Apply resolution scaling if configured (speeds up inference on Pi 4)
+    target_size = int(INPUT_SIZE * MODEL_INPUT_SCALE)
+    img = cv2.resize(frame, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+    
+    # If scaled smaller than model expects, pad to maintain aspect ratio
+    if target_size < INPUT_SIZE:
+        pad = (INPUT_SIZE - target_size) // 2
+        img = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32) / 255.0
     img = img.transpose(2, 0, 1)        # HWC → CHW

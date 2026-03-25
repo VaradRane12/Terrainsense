@@ -1,24 +1,25 @@
 """
 camera.py
 ─────────
-Thread layout
-─────────────
+Process layout (Pi 4 optimization)
+──────────────────────────────────
   Thread A  _camera_capture_worker   Picamera2 → raw_frame_queue   (I/O bound)
-  Thread B  _inference_worker         raw_frame_queue → model → result_frame_queue
+  Process B _inference_worker_proc    raw_frame_queue → model → result_frame_queue (CPU intensive)
   Flask     generate_frames()         result_frame_queue → MJPEG bytes
 
-Both queues have maxsize=2.  If inference falls behind, the camera
-thread drops frames (never blocks).  The MJPEG generator blocks until a
-result is ready, ensuring the client always gets the freshest frame.
+Uses multiprocessing for inference to break Python's GIL and exploit all 4 Pi 4 cores.
+Queues have maxsize=6. Camera drops frames if inference backs up (never blocks).
 """
 
+import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Process, Queue as MPQueue
 
 import cv2
 
-import inference
 import inference_fps
 import recording
 import speech
@@ -31,8 +32,11 @@ except ImportError:
     Picamera2 = None
 
 # ── Frame queues ─────────────────────────────────────────────────────────────
-raw_frame_queue:    queue.Queue = queue.Queue(maxsize=2)
-result_frame_queue: queue.Queue = queue.Queue(maxsize=2)
+raw_frame_queue:    MPQueue = MPQueue(maxsize=6)    # Larger buffer for Pi 4
+result_frame_queue: queue.Queue = queue.Queue(maxsize=6)
+
+# ── JPEG encoder thread pool (async encoding for better throughput) ––––––––––
+_jpeg_encoder = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jpeg")
 
 # ── Camera singleton ──────────────────────────────────────────────────────────
 _camera_lock = threading.Lock()
@@ -45,8 +49,10 @@ _running = threading.Event()
 # ── Public API ────────────────────────────────────────────────────────────────
 def start_pipeline() -> None:
     """
-    Acquire the camera, then start the capture and inference threads.
+    Acquire the camera, then start the capture thread and inference process.
     Call once at app startup.
+    
+    Process-based inference breaks the GIL and uses all 4 Pi 4 cores.
     """
     if Picamera2 is None:
         raise RuntimeError("Picamera2 is not installed. Install it and restart the app.")
@@ -61,13 +67,16 @@ def start_pipeline() -> None:
         name="camera-capture",
     ).start()
 
-    threading.Thread(
-        target=_inference_worker,
+    # Use Process instead of Thread for inference (breaks GIL on Pi 4)
+    proc = Process(
+        target=_inference_worker_proc,
         daemon=True,
-        name="inference",
-    ).start()
+        name="inference-proc",
+    )
+    proc.start()
 
-    print("[INFO] Camera pipeline started (capture + inference threads)")
+    print("[INFO] Camera pipeline started (capture thread + inference process)")
+    print("[INFO] Inference running on dedicated process (GIL-free, uses all cores)")
 
 
 def stop_pipeline() -> None:
@@ -123,34 +132,51 @@ def _camera_capture_worker(picam2) -> None:
 
 def _inference_worker() -> None:
     """
-    Thread B: pull raw frames, run TFLite, draw OSD, enqueue for streaming.
-    Also hands frames to the recording writer (non-blocking).
+    Process worker: pull raw frames, run TFLite, draw OSD, enqueue for streaming.
+    Runs in separate process to bypass Python's GIL and use all 4 Pi 4 cores.
     """
-    print("[INFO] Inference thread running")
+    # Pin this process to cores 1-3, leaving core 0 for camera/Flask
+    try:
+        os.sched_setaffinity(0, {1, 2, 3})
+    except AttributeError:
+        pass  # Windows/macOS don't support cpu_affinity
+
+    # Import here to avoid loading model in main process
+    import inference
+    import sensor
+
+    print("[INFO] Inference process running (pinned to cores 1-3)")
+    
     while _running.is_set() or not raw_frame_queue.empty():
         try:
             frame = raw_frame_queue.get(timeout=0.5)
-        except queue.Empty:
+        except:
             continue
 
-        # Run model
+        # Run model (now uses full CPU without GIL)
         output = inference.run_inference(frame)
         label, color, conf, guidance, speech_text = inference.postprocess(output, frame)
 
         # Track FPS
         inference_fps.record_frame()
 
-        # Hand annotated frame to recording writer (non-blocking)
+        # Hand to recording writer (non-blocking)
         recording.maybe_enqueue_frame(frame)
 
-        # Enqueue speech (non-blocking, rate-limited inside speech.py)
+        # Enqueue speech (non-blocking, rate-limited)
         speech.queue_speech(speech_text)
 
         # Push result to MJPEG stream
         try:
             result_frame_queue.put_nowait(frame)
         except queue.Full:
-            pass   # drop — browser is reading slowly, that's fine
+            pass  # drop slow frame
+
+
+# Wrapper for Process spawn compatibility
+def _inference_worker_proc() -> None:
+    """Wrapper to run inference in a separate process."""
+    _inference_worker()
 
 
 # ── Camera singleton helpers ──────────────────────────────────────────────────

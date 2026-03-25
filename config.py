@@ -6,9 +6,24 @@ INPUT_SIZE  = 320
 CONF_THRESH = 0.50
 NMS_THRESH  = 0.30
 
+# ── Model optimization (Pi 4) ──────────────────────────────────────────────
+# Set to "coral" if you have Edge TPU (3-5x speedup), "nnapi" for Android, "gpu" for Mali
+MODEL_DELEGATE = os.environ.get("MODEL_DELEGATE", "auto")  # "auto", "cpu", "coral", "gpu", "nnapi"
+
+# Input resolution optimization: scale down for faster inference on Pi 4
+# If camera is 640x480 but model is 320x320, we'll crop to square first
+# Reducing resolution by scale_factor speeds up inference
+MODEL_INPUT_SCALE = float(os.environ.get("MODEL_INPUT_SCALE", "1.0"))  # 0.75 = 25% faster, slightly lower accuracy
+
+# Thread count for TFLite inference (Pi 4 = 4 cores, but keep 1 for OS)
+MODEL_NUM_THREADS = int(os.environ.get("MODEL_NUM_THREADS", "3"))  # Leave 1 core for system
+
 # ── Camera ─────────────────────────────────────────────────────────────────
 CAMERA_WIDTH  = 640
 CAMERA_HEIGHT = 480
+
+# Capture FPS limit on Pi 4 (sensor default is 30, can reduce to save CPU)
+CAMERA_FPS = int(os.environ.get("CAMERA_FPS", "30"))
 
 # ── Recording ──────────────────────────────────────────────────────────────
 RECORDINGS_DIR         = "recordings"

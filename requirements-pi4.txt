@@ -1,0 +1,30 @@
+# TerrainSense for Raspberry Pi 4 - Optimized dependencies
+# Install with: pip install -r requirements-pi4.txt
+
+# Flask web server
+Flask==2.3.2
+
+# Computer vision (pre-compiled wheels for ARM64)
+opencv-python==4.13.0.92
+
+# NumPy for array operations
+numpy==1.24.3
+
+# TensorFlow Lite Runtime (lightweight, optimized for Pi)
+# NOTE: If you want GPU acceleration or Edge TPU support, see PI4_OPTIMIZATION.md
+tflite-runtime==2.14.0
+
+# Sensor libraries
+mpu6050-raspberrypi==1.2
+vl53l5cx-ctypes==0.0.3
+
+# IMU orientation filter (Madgwick)
+ahrs==0.4.0
+
+# Optional: For Edge TPU (3-5x faster inference!)
+# Uncomment to enable Coral Edge TPU support:
+# tflite-runtime-armv7l-with-coral==2.14.0
+# or for arm64: tflite-runtime-aarch64-with-coral==2.14.0
+
+# Optional: System monitoring endpoint
+# psutil==5.9.5
