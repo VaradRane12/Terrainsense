@@ -8,6 +8,7 @@ import queue
 import subprocess
 import json
 import math
+import shutil
 from datetime import datetime
 
 INTERPRETER_BACKEND = None
@@ -47,9 +48,14 @@ VOICE_TEST_TEXT = os.environ.get("VOICE_TEST_TEXT", "Audio test from TerrainSens
 ENABLE_SENSOR_BRIDGE = os.environ.get("ENABLE_SENSOR_BRIDGE", "1") == "1"
 SENSOR_STREAM_CMD = os.environ.get("SENSOR_STREAM_CMD", "python sensor_stream.py")
 TOF_ALERT_MM = int(os.environ.get("TOF_ALERT_MM", "900"))
+ENABLE_RECORD_AUDIO = os.environ.get("ENABLE_RECORD_AUDIO", "1") == "1"
+RECORD_AUDIO_RATE = int(os.environ.get("RECORD_AUDIO_RATE", "16000"))
 PERSON_MOVE_PX_PER_SEC = float(os.environ.get("PERSON_MOVE_PX_PER_SEC", "45.0"))
 FALL_ASPECT_THRESHOLD = float(os.environ.get("FALL_ASPECT_THRESHOLD", "1.15"))
 FALL_HEIGHT_DROP_RATIO = float(os.environ.get("FALL_HEIGHT_DROP_RATIO", "0.65"))
+IGNORE_FAR_MM = int(os.environ.get("IGNORE_FAR_MM", "2200"))
+WALK_CORRIDOR_WIDTH_RATIO = float(os.environ.get("WALK_CORRIDOR_WIDTH_RATIO", "0.42"))
+YAW_SHIFT_SCALE = float(os.environ.get("YAW_SHIFT_SCALE", "0.55"))
 
 record_lock = threading.Lock()
 record_state = {
@@ -59,6 +65,10 @@ record_state = {
     "fps": DEFAULT_RECORD_FPS,
     "started_at": 0.0,
     "stop_at": 0.0,
+    "audio_enabled": ENABLE_RECORD_AUDIO,
+    "audio_path": None,
+    "audio_events": [],
+    "audio_error": None,
 }
 
 speech_queue = queue.Queue(maxsize=6)
@@ -81,6 +91,7 @@ sensor_state = {
     "enabled": ENABLE_SENSOR_BRIDGE,
     "front_mm": None,
     "pitch_deg": 0.0,
+    "yaw_deg": 0.0,
     "quat": [1.0, 0.0, 0.0, 0.0],
     "distances": [0] * 64,
     "status": [0] * 64,
@@ -181,6 +192,15 @@ def _quat_to_pitch_deg(quat):
     return float(math.degrees(math.asin(sinp)))
 
 
+def _quat_to_yaw_deg(quat):
+    if not quat or len(quat) != 4:
+        return 0.0
+    w, x, y, z = [float(v) for v in quat]
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return float(math.degrees(math.atan2(siny_cosp, cosy_cosp)))
+
+
 def _sensor_stream_worker():
     if not ENABLE_SENSOR_BRIDGE:
         with sensor_lock:
@@ -227,10 +247,12 @@ def _sensor_stream_worker():
 
             front_mm = _extract_front_mm(distances, status)
             pitch_deg = _quat_to_pitch_deg(quat)
+            yaw_deg = _quat_to_yaw_deg(quat)
 
             with sensor_lock:
                 sensor_state["front_mm"] = front_mm
                 sensor_state["pitch_deg"] = pitch_deg
+                sensor_state["yaw_deg"] = yaw_deg
                 sensor_state["quat"] = quat
                 sensor_state["distances"] = distances
                 sensor_state["status"] = status
@@ -382,6 +404,19 @@ def _person_motion_and_fall(x1, y1, x2, y2, frame_w, frame_h, snap, now):
     }
 
 
+def _walking_corridor(frame_w, snap):
+    yaw_deg = float(snap.get("yaw_deg", 0.0))
+    shift = int(max(-0.25, min(0.25, yaw_deg / 90.0)) * frame_w * YAW_SHIFT_SCALE)
+    center = (frame_w // 2) + shift
+    half = int(max(0.2, min(0.8, WALK_CORRIDOR_WIDTH_RATIO)) * frame_w * 0.5)
+    return max(0, center - half), min(frame_w - 1, center + half)
+
+
+def _is_in_corridor(x1, x2, corridor_x1, corridor_x2):
+    cx = 0.5 * (x1 + x2)
+    return corridor_x1 <= cx <= corridor_x2
+
+
 def direction_guidance(label, x1, x2, width, snap=None):
     center_x = (x1 + x2) / 2.0
     left_band = width * 0.38
@@ -457,6 +492,11 @@ def queue_speech(text):
     speech_state["last_text"] = text
     speech_state["last_time"] = now
 
+    with record_lock:
+        if record_state["active"]:
+            t_rel = max(0.0, now - record_state["started_at"])
+            record_state["audio_events"].append({"t": t_rel, "text": text})
+
     try:
         speech_queue.put_nowait(text)
     except queue.Full:
@@ -490,6 +530,7 @@ def postprocess(output, frame):
     snap = get_sensor_snapshot()
     now = time.time()
     h_frame, w_frame = frame.shape[:2]
+    corridor_x1, corridor_x2 = _walking_corridor(w_frame, snap)
     preds        = output[0].squeeze(0).T
     class_scores = sigmoid(preds[:, 4:])
     confidences  = np.max(class_scores, axis=1)
@@ -499,26 +540,43 @@ def postprocess(output, frame):
         if snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
             return None, (0, 165, 255), 0.0, f"TOF obstacle {snap['front_mm']} mm", f"Stop. obstacle at {snap['front_mm']} millimeters"
         return None, (0, 255, 0), 0.0, "Path clear", None
-    boxes_f   = preds[:, :4][mask]
-    confs_f   = confidences[mask].tolist()
-    classes_f = class_ids[mask]
+    boxes_f_raw = preds[:, :4][mask]
+    confs_raw = confidences[mask]
+    classes_raw = class_ids[mask]
     scale_x = w_frame / INPUT_SIZE
     scale_y = h_frame / INPUT_SIZE
+
     boxes_xyxy = []
-    for box in boxes_f:
+    confs_f = []
+    classes_f = []
+    for i, box in enumerate(boxes_f_raw):
         cx, cy, bw, bh = box
         x1 = max(0, int((cx - bw/2) * scale_x))
         y1 = max(0, int((cy - bh/2) * scale_y))
         x2 = min(w_frame, int((cx + bw/2) * scale_x))
         y2 = min(h_frame, int((cy + bh/2) * scale_y))
+
+        if not _is_in_corridor(x1, x2, corridor_x1, corridor_x2):
+            continue
+
+        obj_mm = _tof_mm_for_bbox(snap, x1, x2, w_frame)
+        if obj_mm is not None and obj_mm > IGNORE_FAR_MM:
+            continue
+
         boxes_xyxy.append([x1, y1, x2, y2])
+        confs_f.append(float(confs_raw[i]))
+        classes_f.append(int(classes_raw[i]))
+
+    if not boxes_xyxy:
+        return None, (0, 255, 0), 0.0, "Path clear (corridor)", None
+
     boxes_nms = [[x1, y1, x2-x1, y2-y1] for x1,y1,x2,y2 in boxes_xyxy]
-    indices   = cv2.dnn.NMSBoxes(boxes_nms, confs_f, CONF_THRESH, NMS_THRESH)
+    indices = cv2.dnn.NMSBoxes(boxes_nms, confs_f, CONF_THRESH, NMS_THRESH)
     if len(indices) == 0:
         if snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
             return None, (0, 165, 255), 0.0, f"TOF obstacle {snap['front_mm']} mm", f"Stop. obstacle at {snap['front_mm']} millimeters"
         return None, (0, 255, 0), 0.0, "Path clear", None
-    best_i       = max(indices.flatten(), key=lambda i: confs_f[i])
+    best_i = max(indices.flatten(), key=lambda i: confs_f[i])
     x1, y1, x2, y2 = boxes_xyxy[best_i]
     conf         = float(confs_f[best_i])
     label, color = CLASS_LABELS.get(int(classes_f[best_i]), ("UNKNOWN", (255,255,255)))
@@ -608,6 +666,143 @@ def _create_recording_path():
     return os.path.join(RECORDINGS_DIR, f"terrain_{stamp}.mp4")
 
 
+def _create_recording_audio_path(video_path):
+    base, _ = os.path.splitext(video_path)
+    return f"{base}_tts.wav"
+
+
+def _get_tts_engine_path():
+    for engine in ("espeak", "espeak-ng"):
+        path = shutil.which(engine)
+        if path:
+            return path
+    return None
+
+
+def _render_tts_audio_locked(video_path, duration_sec):
+    if not record_state["audio_enabled"]:
+        return None, False
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        record_state["audio_error"] = "ffmpeg not found; recording video only"
+        return None, False
+
+    tts_engine = _get_tts_engine_path()
+    if tts_engine is None:
+        record_state["audio_error"] = "espeak/espeak-ng not found; recording video only"
+        return None, False
+
+    events = list(record_state["audio_events"])
+    if not events:
+        return None, False
+
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    tmp_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    tmp_files = []
+
+    for i, evt in enumerate(events):
+        text = str(evt.get("text", "")).strip()
+        if not text:
+            continue
+        wav_i = os.path.join(RECORDINGS_DIR, f".tts_{tmp_stamp}_{i}.wav")
+        cmd_tts = [tts_engine, "-s", VOICE_RATE, "-w", wav_i, text]
+        res = subprocess.run(cmd_tts, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0 and os.path.exists(wav_i) and os.path.getsize(wav_i) > 128:
+            delay_ms = max(0, int(float(evt.get("t", 0.0)) * 1000.0))
+            tmp_files.append((delay_ms, wav_i))
+
+    if not tmp_files:
+        record_state["audio_error"] = "No narration clips generated"
+        return None, False
+
+    audio_path = _create_recording_audio_path(video_path)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "lavfi",
+        "-t",
+        f"{max(0.5, float(duration_sec)):.3f}",
+        "-i",
+        f"anullsrc=r={RECORD_AUDIO_RATE}:cl=mono",
+    ]
+
+    for _, wav_i in tmp_files:
+        cmd += ["-i", wav_i]
+
+    filters = []
+    mix_inputs = ["[0:a]"]
+    for i, (delay_ms, _) in enumerate(tmp_files, start=1):
+        label = f"a{i}"
+        filters.append(f"[{i}:a]adelay={delay_ms}|{delay_ms}[{label}]")
+        mix_inputs.append(f"[{label}]")
+
+    filters.append(f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:normalize=0[aout]")
+    cmd += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[aout]",
+        "-ac",
+        "1",
+        "-ar",
+        str(RECORD_AUDIO_RATE),
+        audio_path,
+    ]
+
+    result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for _, wav_i in tmp_files:
+        try:
+            os.remove(wav_i)
+        except OSError:
+            pass
+
+    if result.returncode != 0 or not os.path.exists(audio_path) or os.path.getsize(audio_path) < 128:
+        record_state["audio_error"] = "Failed to build narration audio"
+        return None, False
+
+    record_state["audio_path"] = audio_path
+    return audio_path, True
+
+
+def _mux_audio_video_locked(video_path, audio_path=None):
+    use_audio = audio_path or record_state["audio_path"]
+    if not record_state["audio_enabled"] or not use_audio:
+        return video_path, False
+
+    if not os.path.exists(use_audio) or os.path.getsize(use_audio) < 128:
+        return video_path, False
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return video_path, False
+
+    base, ext = os.path.splitext(video_path)
+    merged_path = f"{base}_av{ext}"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        use_audio,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-shortest",
+        merged_path,
+    ]
+    result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if result.returncode != 0 or not os.path.exists(merged_path):
+        return video_path, False
+
+    os.replace(merged_path, video_path)
+    return video_path, True
+
+
 def _stop_recording_locked():
     writer = record_state["writer"]
     if writer is not None:
@@ -618,16 +813,29 @@ def _stop_recording_locked():
     started_at = record_state["started_at"]
     duration_sec = max(0.0, time.time() - started_at) if started_at else 0.0
 
+    final_path = saved_path
+    had_audio = False
+    if saved_path:
+        audio_path, built_audio = _render_tts_audio_locked(saved_path, duration_sec)
+        if built_audio:
+            final_path, had_audio = _mux_audio_video_locked(saved_path, audio_path=audio_path)
+        else:
+            final_path, had_audio = _mux_audio_video_locked(saved_path)
+
     record_state["active"] = False
     record_state["writer"] = None
     record_state["path"] = None
     record_state["started_at"] = 0.0
     record_state["stop_at"] = 0.0
+    record_state["audio_path"] = None
+    record_state["audio_events"] = []
 
     return {
         "ok": True,
         "was_active": was_active,
-        "saved_to": saved_path,
+        "saved_to": final_path,
+        "audio_recorded": had_audio,
+        "audio_error": record_state["audio_error"],
         "duration_sec": round(duration_sec, 2),
     }
 
@@ -653,6 +861,9 @@ def start_recording(minutes, fps):
         record_state["fps"] = float(fps)
         record_state["started_at"] = now
         record_state["stop_at"] = now + (float(minutes) * 60.0)
+        record_state["audio_path"] = None
+        record_state["audio_events"] = []
+        record_state["audio_error"] = None
 
         return {
             "ok": True,
@@ -660,6 +871,8 @@ def start_recording(minutes, fps):
             "minutes": float(minutes),
             "fps": float(fps),
             "saved_to": record_state["path"],
+            "audio_enabled": record_state["audio_enabled"],
+            "audio_error": record_state["audio_error"],
         }
 
 
@@ -677,6 +890,9 @@ def get_record_status():
             "saved_to": record_state["path"],
             "seconds_left": round(left, 1),
             "fps": record_state["fps"],
+            "audio_enabled": record_state["audio_enabled"],
+            "audio_active": record_state["active"],
+            "audio_error": record_state["audio_error"],
         }
 
 
@@ -735,6 +951,10 @@ def generate_frames():
             cv2.putText(frame, f"Conf: {conf:.2f}  |  FPS: {avg_fps:.1f}", (20, h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
             snap = get_sensor_snapshot()
+            c1, c2 = _walking_corridor(w, snap)
+            cv2.rectangle(frame, (c1, 65), (c2, h - 70), (120, 120, 120), 1)
+            cv2.putText(frame, "Walk corridor", (c1 + 5, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
             if not snap.get("enabled", False):
                 tof_text = "ToF front: disabled"
             elif snap.get("front_mm") is not None:
@@ -745,6 +965,7 @@ def generate_frames():
                 tof_text = "ToF front: no valid target"
             cv2.putText(frame, tof_text, (w - 265, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
             cv2.putText(frame, f"Pitch: {snap.get('pitch_deg', 0.0):.1f} deg", (w - 265, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(frame, f"Yaw: {snap.get('yaw_deg', 0.0):.1f} deg  Far>{IGNORE_FAR_MM}mm ignored", (20, h-68), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 190, 190), 1)
             draw_tof_grid(frame, snap)
             queue_speech(speech_text)
             maybe_write_recording(frame)
