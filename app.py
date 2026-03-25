@@ -4,6 +4,8 @@ import numpy as np
 import time
 import os
 import threading
+import queue
+import subprocess
 from datetime import datetime
 
 INTERPRETER_BACKEND = None
@@ -36,6 +38,10 @@ CAMERA_HEIGHT = 480
 RECORDINGS_DIR = "recordings"
 DEFAULT_RECORD_MINUTES = 5.0
 DEFAULT_RECORD_FPS = 20.0
+ENABLE_VOICE = os.environ.get("ENABLE_VOICE", "1") == "1"
+VOICE_INTERVAL_SEC = float(os.environ.get("VOICE_INTERVAL_SEC", "3.0"))
+VOICE_RATE = os.environ.get("VOICE_RATE", "165")
+VOICE_TEST_TEXT = os.environ.get("VOICE_TEST_TEXT", "Audio test from TerrainSense")
 
 record_lock = threading.Lock()
 record_state = {
@@ -45,6 +51,21 @@ record_state = {
     "fps": DEFAULT_RECORD_FPS,
     "started_at": 0.0,
     "stop_at": 0.0,
+}
+
+speech_queue = queue.Queue(maxsize=6)
+speech_state = {
+    "enabled": ENABLE_VOICE,
+    "last_text": "",
+    "last_time": 0.0,
+    "warned_missing_engine": False,
+}
+
+camera_lock = threading.Lock()
+capture_lock = threading.Lock()
+camera_state = {
+    "instance": None,
+    "users": 0,
 }
 
 CLASS_LABELS = {
@@ -106,6 +127,103 @@ def run_inference(frame):
 
     return [output]
 
+
+def direction_guidance(label, x1, x2, width):
+    center_x = (x1 + x2) / 2.0
+    left_band = width * 0.38
+    right_band = width * 0.62
+
+    if center_x < left_band:
+        side = "left"
+        move = "right"
+    elif center_x > right_band:
+        side = "right"
+        move = "left"
+    else:
+        side = "center"
+        move = "stop"
+
+    if move == "stop":
+        guidance_text = f"{label} ahead - slow/stop"
+        speech_text = f"Stop. {label.lower()} ahead"
+    else:
+        guidance_text = f"{label} on {side} - move {move}"
+        speech_text = f"Move {move}. {label.lower()} ahead"
+
+    return guidance_text, speech_text
+
+
+def _speech_worker():
+    while True:
+        text = speech_queue.get()
+        if text is None:
+            speech_queue.task_done()
+            break
+
+        if speech_state["enabled"]:
+            ok = False
+            for engine in ("espeak", "espeak-ng"):
+                try:
+                    subprocess.run(
+                        [engine, "-s", VOICE_RATE, text],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    ok = True
+                    break
+                except FileNotFoundError:
+                    continue
+
+            if not ok:
+                if not speech_state["warned_missing_engine"]:
+                    print("[WARN] No speech engine found. Install espeak or espeak-ng to enable voice guidance.")
+                    speech_state["warned_missing_engine"] = True
+                speech_state["enabled"] = False
+
+        speech_queue.task_done()
+
+
+def queue_speech(text):
+    if not text or not speech_state["enabled"]:
+        return
+
+    now = time.time()
+    if now - speech_state["last_time"] < VOICE_INTERVAL_SEC:
+        return
+
+    if text == speech_state["last_text"] and now - speech_state["last_time"] < (VOICE_INTERVAL_SEC * 2.0):
+        return
+
+    speech_state["last_text"] = text
+    speech_state["last_time"] = now
+
+    try:
+        speech_queue.put_nowait(text)
+    except queue.Full:
+        pass
+
+
+def set_voice_enabled(enabled):
+    speech_state["enabled"] = bool(enabled)
+    return {
+        "ok": True,
+        "voice_enabled": speech_state["enabled"],
+        "interval_sec": VOICE_INTERVAL_SEC,
+    }
+
+
+def get_voice_status():
+    return {
+        "ok": True,
+        "voice_enabled": speech_state["enabled"],
+        "interval_sec": VOICE_INTERVAL_SEC,
+    }
+
+
+speech_thread = threading.Thread(target=_speech_worker, daemon=True)
+speech_thread.start()
+
 # ───────────────────────────────────────────────
 #  POSTPROCESS
 # ───────────────────────────────────────────────
@@ -134,35 +252,70 @@ def postprocess(output, frame):
     boxes_nms = [[x1, y1, x2-x1, y2-y1] for x1,y1,x2,y2 in boxes_xyxy]
     indices   = cv2.dnn.NMSBoxes(boxes_nms, confs_f, CONF_THRESH, NMS_THRESH)
     if len(indices) == 0:
-        return None, None, 0.0
+        return None, None, 0.0, "Path clear", None
     best_i       = max(indices.flatten(), key=lambda i: confs_f[i])
     x1, y1, x2, y2 = boxes_xyxy[best_i]
     conf         = float(confs_f[best_i])
     label, color = CLASS_LABELS.get(int(classes_f[best_i]), ("UNKNOWN", (255,255,255)))
+    guidance_text, speech_text = direction_guidance(label, x1, x2, w_frame)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
     text        = f"{label}  {conf:.2f}"
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
     cv2.rectangle(frame, (x1, y1-th-12), (x1+tw+8, y1), color, -1)
     cv2.putText(frame, text, (x1+4, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
-    return label, color, conf
+    return label, color, conf, guidance_text, speech_text
 
 
-def create_frame_source():
+def acquire_camera():
     if not USE_PI_CAMERA:
         raise RuntimeError("USE_PI_CAMERA is set to 0, but this app now requires Picamera2 camera input.")
 
     if Picamera2 is None:
         raise RuntimeError("Picamera2 is not installed. Install it and restart the app.")
 
-    print("[INFO] Starting Picamera2 stream...")
-    picam2 = Picamera2()
-    config = picam2.create_video_configuration(
-        main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
-    )
-    picam2.configure(config)
-    picam2.start()
-    time.sleep(0.2)
-    return "picamera2", picam2
+    with camera_lock:
+        if camera_state["instance"] is None:
+            print("[INFO] Starting Picamera2 stream...")
+            picam2 = Picamera2()
+            try:
+                config = picam2.create_video_configuration(
+                    main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
+                )
+                picam2.configure(config)
+                picam2.start()
+                time.sleep(0.2)
+            except Exception:
+                try:
+                    picam2.stop()
+                except Exception:
+                    pass
+                try:
+                    picam2.close()
+                except Exception:
+                    pass
+                raise
+            camera_state["instance"] = picam2
+
+        camera_state["users"] += 1
+        return camera_state["instance"]
+
+
+def release_camera():
+    with camera_lock:
+        if camera_state["users"] > 0:
+            camera_state["users"] -= 1
+
+        if camera_state["users"] == 0 and camera_state["instance"] is not None:
+            picam2 = camera_state["instance"]
+            camera_state["instance"] = None
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+            try:
+                picam2.close()
+            except Exception:
+                pass
 
 
 def _create_recording_path():
@@ -267,11 +420,12 @@ def maybe_write_recording(frame):
 #  FRAME GENERATOR
 # ───────────────────────────────────────────────
 def generate_frames():
-    _, source = create_frame_source()
+    source = acquire_camera()
     fps_list = []
     try:
         while True:
-            frame = source.capture_array()
+            with capture_lock:
+                frame = source.capture_array()
             if frame is None:
                 continue
             if frame.ndim == 2:
@@ -289,10 +443,12 @@ def generate_frames():
             fps_list.append(fps)
             avg_fps = sum(fps_list[-10:]) / len(fps_list[-10:])
             result = postprocess(output, frame)
-            label, color, conf = result if result[0] else ("ALL CLEAR", (0,255,0), 0.0)
+            label, color, conf, guidance, speech_text = result if result[0] else ("ALL CLEAR", (0,255,0), 0.0, "Path clear", None)
             cv2.rectangle(frame, (0, 0), (w, 60), (0,0,0), -1)
             cv2.putText(frame, f"  {label}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.3, color, 3)
+            cv2.putText(frame, guidance, (20, h-45), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (80,255,200), 2)
             cv2.putText(frame, f"Conf: {conf:.2f}  |  FPS: {avg_fps:.1f}", (20, h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            queue_speech(speech_text)
             maybe_write_recording(frame)
             _, buffer = cv2.imencode('.jpg', frame)
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
@@ -300,7 +456,7 @@ def generate_frames():
         with record_lock:
             if record_state["active"]:
                 _stop_recording_locked()
-        source.stop()
+        release_camera()
 
 # ───────────────────────────────────────────────
 #  FLASK ROUTES
@@ -314,7 +470,11 @@ def index():
         "Minutes: <input id='mins' type='number' min='1' value='5' style='width:70px;'>"
         "<button onclick='startRec()' style='margin-left:8px;padding:8px 12px;'>Start Recording</button>"
         "<button onclick='stopRec()' style='margin-left:8px;padding:8px 12px;'>Stop</button>"
+        "<button onclick='voiceOn()' style='margin-left:8px;padding:8px 12px;'>Voice ON</button>"
+        "<button onclick='voiceOff()' style='margin-left:8px;padding:8px 12px;'>Voice OFF</button>"
+        "<button onclick='voiceTest()' style='margin-left:8px;padding:8px 12px;'>Voice TEST</button>"
         "<div id='recStatus' style='margin-top:8px;font-size:14px;'></div>"
+        "<div id='voiceStatus' style='margin-top:4px;font-size:14px;'></div>"
         "</div>"
         "<img src='/video_feed' style='width:100%;max-width:860px;border:2px solid #00ff99;border-radius:8px;'>"
         "<script>"
@@ -325,6 +485,9 @@ def index():
         "    ? `Recording ON | ${j.seconds_left}s left | File: ${j.saved_to}`"
         "    : 'Recording OFF';"
         "  document.getElementById('recStatus').textContent = status;"
+        "  const vr = await fetch('/voice/status');"
+        "  const vj = await vr.json();"
+        "  document.getElementById('voiceStatus').textContent = vj.voice_enabled ? 'Voice ON' : 'Voice OFF';"
         "}"
         "async function startRec(){"
         "  const m = document.getElementById('mins').value || '5';"
@@ -336,6 +499,19 @@ def index():
         "  const r = await fetch('/record/stop');"
         "  const j = await r.json();"
         "  document.getElementById('recStatus').textContent = j.saved_to ? ('Saved: ' + j.saved_to) : 'Stopped';"
+        "}"
+        "async function voiceOn(){"
+        "  await fetch('/voice/on');"
+        "  refreshStatus();"
+        "}"
+        "async function voiceOff(){"
+        "  await fetch('/voice/off');"
+        "  refreshStatus();"
+        "}"
+        "async function voiceTest(){"
+        "  const r = await fetch('/voice/test');"
+        "  const j = await r.json();"
+        "  document.getElementById('voiceStatus').textContent = j.message || j.error || 'Voice test sent';"
         "}"
         "setInterval(refreshStatus, 1000);"
         "refreshStatus();"
@@ -369,7 +545,35 @@ def record_stop():
 def record_status():
     return jsonify(get_record_status()), 200
 
+
+@app.route('/voice/status', methods=['GET'])
+def voice_status():
+    return jsonify(get_voice_status()), 200
+
+
+@app.route('/voice/on', methods=['GET', 'POST'])
+def voice_on():
+    return jsonify(set_voice_enabled(True)), 200
+
+
+@app.route('/voice/off', methods=['GET', 'POST'])
+def voice_off():
+    return jsonify(set_voice_enabled(False)), 200
+
+
+@app.route('/voice/test', methods=['GET', 'POST'])
+def voice_test():
+    if not speech_state["enabled"]:
+        return jsonify({"ok": False, "error": "Voice is OFF. Turn voice on first."}), 409
+
+    queue_speech(VOICE_TEST_TEXT)
+    return jsonify({"ok": True, "message": f"Queued voice test: {VOICE_TEST_TEXT}"}), 200
+
 if __name__ == '__main__':
     print("[INFO] Open browser at http://<raspberry-pi-ip>:5000")
     print("[INFO] Camera source: Picamera2 only")
+    if ENABLE_VOICE:
+        print(f"[INFO] Voice guidance: enabled (min interval {VOICE_INTERVAL_SEC:.1f}s)")
+    else:
+        print("[INFO] Voice guidance: disabled")
     app.run(host='0.0.0.0', port=5000, debug=False)
