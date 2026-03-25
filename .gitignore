@@ -1,0 +1,8 @@
+.venv
+venv
+venv_system
+pyenv311
+.DS_Store
+__pycache__
+walk_test.mp4
+._*
