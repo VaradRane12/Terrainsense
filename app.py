@@ -6,6 +6,8 @@ import os
 import threading
 import queue
 import subprocess
+import json
+import math
 from datetime import datetime
 
 INTERPRETER_BACKEND = None
@@ -42,6 +44,12 @@ ENABLE_VOICE = os.environ.get("ENABLE_VOICE", "1") == "1"
 VOICE_INTERVAL_SEC = float(os.environ.get("VOICE_INTERVAL_SEC", "3.0"))
 VOICE_RATE = os.environ.get("VOICE_RATE", "165")
 VOICE_TEST_TEXT = os.environ.get("VOICE_TEST_TEXT", "Audio test from TerrainSense")
+ENABLE_SENSOR_BRIDGE = os.environ.get("ENABLE_SENSOR_BRIDGE", "1") == "1"
+SENSOR_STREAM_CMD = os.environ.get("SENSOR_STREAM_CMD", "python sensor_stream.py")
+TOF_ALERT_MM = int(os.environ.get("TOF_ALERT_MM", "900"))
+PERSON_MOVE_PX_PER_SEC = float(os.environ.get("PERSON_MOVE_PX_PER_SEC", "45.0"))
+FALL_ASPECT_THRESHOLD = float(os.environ.get("FALL_ASPECT_THRESHOLD", "1.15"))
+FALL_HEIGHT_DROP_RATIO = float(os.environ.get("FALL_HEIGHT_DROP_RATIO", "0.65"))
 
 record_lock = threading.Lock()
 record_state = {
@@ -66,6 +74,24 @@ capture_lock = threading.Lock()
 camera_state = {
     "instance": None,
     "users": 0,
+}
+
+sensor_lock = threading.Lock()
+sensor_state = {
+    "enabled": ENABLE_SENSOR_BRIDGE,
+    "front_mm": None,
+    "pitch_deg": 0.0,
+    "quat": [1.0, 0.0, 0.0, 0.0],
+    "distances": [0] * 64,
+    "status": [0] * 64,
+    "last_update": 0.0,
+    "error": None,
+}
+
+person_state = {
+    "last_center_x": None,
+    "last_height": None,
+    "last_time": 0.0,
 }
 
 CLASS_LABELS = {
@@ -128,7 +154,235 @@ def run_inference(frame):
     return [output]
 
 
-def direction_guidance(label, x1, x2, width):
+def _extract_front_mm(distances, status):
+    # Center 4x4 cells in 8x8 grid.
+    idxs = [
+        18, 19, 20, 21,
+        26, 27, 28, 29,
+        34, 35, 36, 37,
+        42, 43, 44, 45,
+    ]
+
+    vals = [int(distances[i]) for i in idxs if i < len(distances) and i < len(status) and status[i] == 5 and distances[i] > 0]
+    if not vals:
+        # Fallback when status bits are sparse but distances exist.
+        vals = [int(distances[i]) for i in idxs if i < len(distances) and distances[i] > 0]
+    if not vals:
+        return None
+    return int(np.median(vals))
+
+
+def _quat_to_pitch_deg(quat):
+    if not quat or len(quat) != 4:
+        return 0.0
+    w, x, y, z = [float(v) for v in quat]
+    sinp = 2.0 * (w * y - z * x)
+    sinp = max(-1.0, min(1.0, sinp))
+    return float(math.degrees(math.asin(sinp)))
+
+
+def _sensor_stream_worker():
+    if not ENABLE_SENSOR_BRIDGE:
+        with sensor_lock:
+            sensor_state["error"] = "Sensor bridge disabled"
+        return
+
+    try:
+        proc = subprocess.Popen(
+            SENSOR_STREAM_CMD,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as exc:
+        with sensor_lock:
+            sensor_state["error"] = f"Failed to start sensor stream: {exc}"
+        return
+
+    print(f"[INFO] Sensor bridge started: {SENSOR_STREAM_CMD}")
+
+    if proc.stdout is None:
+        with sensor_lock:
+            sensor_state["error"] = "Sensor stream stdout unavailable"
+        return
+
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pkt = json.loads(line)
+            distances = list(pkt.get("distances", []))[:64]
+            status = list(pkt.get("status", []))[:64]
+            quat = list(pkt.get("quat", [1.0, 0.0, 0.0, 0.0]))[:4]
+
+            if len(distances) < 64:
+                distances += [0] * (64 - len(distances))
+            if len(status) < 64:
+                status += [0] * (64 - len(status))
+            if len(quat) < 4:
+                quat = [1.0, 0.0, 0.0, 0.0]
+
+            front_mm = _extract_front_mm(distances, status)
+            pitch_deg = _quat_to_pitch_deg(quat)
+
+            with sensor_lock:
+                sensor_state["front_mm"] = front_mm
+                sensor_state["pitch_deg"] = pitch_deg
+                sensor_state["quat"] = quat
+                sensor_state["distances"] = distances
+                sensor_state["status"] = status
+                sensor_state["last_update"] = time.time()
+                sensor_state["error"] = None
+        except Exception as exc:
+            with sensor_lock:
+                sensor_state["error"] = f"Sensor parse error: {exc}"
+
+    with sensor_lock:
+        sensor_state["error"] = "Sensor stream stopped"
+
+
+def get_sensor_snapshot():
+    with sensor_lock:
+        return dict(sensor_state)
+
+
+def _tof_cell_color(d_mm, st):
+    if st != 5 or d_mm <= 0:
+        return (45, 45, 45)
+    d = max(200, min(3000, int(d_mm)))
+    t = (d - 200) / 2800.0
+    return (0, int(255 * t), int(255 * (1.0 - t)))
+
+
+def draw_tof_grid(frame, snap):
+    dists = snap.get("distances", [0] * 64)
+    stats = snap.get("status", [0] * 64)
+
+    h, w = frame.shape[:2]
+    cell = 14
+    gap = 2
+    size = (cell + gap) * 8 + gap
+    x0 = w - size - 18
+    y0 = 70
+
+    cv2.rectangle(frame, (x0 - 8, y0 - 24), (x0 + size + 8, y0 + size + 8), (20, 20, 20), -1)
+    cv2.putText(frame, "ToF 8x8", (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+
+    for r in range(8):
+        for c in range(8):
+            i = r * 8 + c
+            col = _tof_cell_color(dists[i], stats[i])
+            x1 = x0 + gap + c * (cell + gap)
+            y1 = y0 + gap + r * (cell + gap)
+            x2 = x1 + cell
+            y2 = y1 + cell
+            cv2.rectangle(frame, (x1, y1), (x2, y2), col, -1)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 30, 30), 1)
+
+    # Center 4x4 region.
+    cx1 = x0 + gap + 2 * (cell + gap)
+    cy1 = y0 + gap + 2 * (cell + gap)
+    cx2 = x0 + gap + 6 * (cell + gap) - gap
+    cy2 = y0 + gap + 6 * (cell + gap) - gap
+    cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (255, 255, 255), 1)
+
+
+def _tof_mm_for_bbox(snap, x1, x2, frame_w):
+    dists = snap.get("distances", [0] * 64)
+    stats = snap.get("status", [0] * 64)
+
+    c0 = max(0, min(7, int((x1 / max(1, frame_w)) * 8)))
+    c1 = max(0, min(7, int((x2 / max(1, frame_w)) * 8)))
+    if c1 < c0:
+        c0, c1 = c1, c0
+
+    vals = []
+    for r in range(8):
+        for c in range(c0, c1 + 1):
+            i = r * 8 + c
+            if i < len(dists) and i < len(stats) and stats[i] == 5 and dists[i] > 0:
+                vals.append(int(dists[i]))
+
+    if not vals:
+        return snap.get("front_mm")
+    return int(np.median(vals))
+
+
+def _tof_nearest_side(snap):
+    dists = snap.get("distances", [0] * 64)
+    stats = snap.get("status", [0] * 64)
+    bands = {
+        "left": [0, 1, 2],
+        "center": [3, 4],
+        "right": [5, 6, 7],
+    }
+
+    best_side = None
+    best_mm = None
+    for side, cols in bands.items():
+        vals = []
+        for r in range(8):
+            for c in cols:
+                i = r * 8 + c
+                if i < len(dists) and i < len(stats) and stats[i] == 5 and dists[i] > 0:
+                    vals.append(int(dists[i]))
+        if vals:
+            mm = int(np.median(vals))
+            if best_mm is None or mm < best_mm:
+                best_mm = mm
+                best_side = side
+    return best_side, best_mm
+
+
+def _person_motion_and_fall(x1, y1, x2, y2, frame_w, frame_h, snap, now):
+    center_x = 0.5 * (x1 + x2)
+    height = max(1.0, float(y2 - y1))
+    width = max(1.0, float(x2 - x1))
+
+    if center_x < frame_w * 0.38:
+        person_side = "left"
+    elif center_x > frame_w * 0.62:
+        person_side = "right"
+    else:
+        person_side = "center"
+
+    motion = "steady"
+    prev_x = person_state["last_center_x"]
+    prev_t = person_state["last_time"]
+    if prev_x is not None and prev_t > 0.0:
+        dt = max(1e-3, now - prev_t)
+        vx = (center_x - prev_x) / dt
+        if vx > PERSON_MOVE_PX_PER_SEC:
+            motion = "moving right"
+        elif vx < -PERSON_MOVE_PX_PER_SEC:
+            motion = "moving left"
+
+    aspect = width / height
+    prev_h = person_state["last_height"]
+    drop = (prev_h is not None and height < float(prev_h) * FALL_HEIGHT_DROP_RATIO)
+    tilt = abs(float(snap.get("pitch_deg", 0.0)))
+    fall_risk = (aspect > FALL_ASPECT_THRESHOLD and height < frame_h * 0.45) or (drop and tilt > 8.0)
+
+    person_mm = _tof_mm_for_bbox(snap, x1, x2, frame_w)
+    tof_side, _ = _tof_nearest_side(snap)
+
+    person_state["last_center_x"] = center_x
+    person_state["last_height"] = height
+    person_state["last_time"] = now
+
+    return {
+        "side": person_side,
+        "motion": motion,
+        "fall_risk": fall_risk,
+        "person_mm": person_mm,
+        "tof_side": tof_side,
+    }
+
+
+def direction_guidance(label, x1, x2, width, snap=None):
     center_x = (x1 + x2) / 2.0
     left_band = width * 0.38
     right_band = width * 0.62
@@ -149,6 +403,11 @@ def direction_guidance(label, x1, x2, width):
     else:
         guidance_text = f"{label} on {side} - move {move}"
         speech_text = f"Move {move}. {label.lower()} ahead"
+
+    if snap is not None and snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
+        guidance_text = f"{guidance_text} | {snap['front_mm']} mm"
+        if move == "stop":
+            speech_text = f"Stop. {label.lower()} at {snap['front_mm']} millimeters"
 
     return guidance_text, speech_text
 
@@ -228,6 +487,8 @@ speech_thread.start()
 #  POSTPROCESS
 # ───────────────────────────────────────────────
 def postprocess(output, frame):
+    snap = get_sensor_snapshot()
+    now = time.time()
     h_frame, w_frame = frame.shape[:2]
     preds        = output[0].squeeze(0).T
     class_scores = sigmoid(preds[:, 4:])
@@ -235,7 +496,9 @@ def postprocess(output, frame):
     class_ids    = np.argmax(class_scores, axis=1)
     mask = confidences > CONF_THRESH
     if not np.any(mask):
-        return None, None, 0.0
+        if snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
+            return None, (0, 165, 255), 0.0, f"TOF obstacle {snap['front_mm']} mm", f"Stop. obstacle at {snap['front_mm']} millimeters"
+        return None, (0, 255, 0), 0.0, "Path clear", None
     boxes_f   = preds[:, :4][mask]
     confs_f   = confidences[mask].tolist()
     classes_f = class_ids[mask]
@@ -252,12 +515,33 @@ def postprocess(output, frame):
     boxes_nms = [[x1, y1, x2-x1, y2-y1] for x1,y1,x2,y2 in boxes_xyxy]
     indices   = cv2.dnn.NMSBoxes(boxes_nms, confs_f, CONF_THRESH, NMS_THRESH)
     if len(indices) == 0:
-        return None, None, 0.0, "Path clear", None
+        if snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
+            return None, (0, 165, 255), 0.0, f"TOF obstacle {snap['front_mm']} mm", f"Stop. obstacle at {snap['front_mm']} millimeters"
+        return None, (0, 255, 0), 0.0, "Path clear", None
     best_i       = max(indices.flatten(), key=lambda i: confs_f[i])
     x1, y1, x2, y2 = boxes_xyxy[best_i]
     conf         = float(confs_f[best_i])
     label, color = CLASS_LABELS.get(int(classes_f[best_i]), ("UNKNOWN", (255,255,255)))
-    guidance_text, speech_text = direction_guidance(label, x1, x2, w_frame)
+    guidance_text, speech_text = direction_guidance(label, x1, x2, w_frame, snap=snap)
+
+    if label == "PERSON":
+        person_info = _person_motion_and_fall(x1, y1, x2, y2, w_frame, h_frame, snap, now)
+        if person_info["fall_risk"]:
+            guidance_text = "PERSON fall risk - assist immediately"
+            speech_text = "Alert. person may be falling"
+            color = (0, 0, 255)
+        else:
+            mm = person_info["person_mm"]
+            if mm is not None:
+                guidance_text = f"PERSON {person_info['motion']} | {mm} mm"
+                speech_text = f"Person {person_info['motion']}. Distance {mm} millimeters"
+            else:
+                guidance_text = f"PERSON {person_info['motion']}"
+                speech_text = f"Person {person_info['motion']}"
+
+            if person_info["tof_side"] and person_info["tof_side"] != person_info["side"]:
+                guidance_text = f"{guidance_text} | ToF nearer {person_info['tof_side']}"
+
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
     text        = f"{label}  {conf:.2f}"
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
@@ -443,11 +727,25 @@ def generate_frames():
             fps_list.append(fps)
             avg_fps = sum(fps_list[-10:]) / len(fps_list[-10:])
             result = postprocess(output, frame)
-            label, color, conf, guidance, speech_text = result if result[0] else ("ALL CLEAR", (0,255,0), 0.0, "Path clear", None)
+            label, color, conf, guidance, speech_text = result
+            display_label = label if label else "ALL CLEAR"
             cv2.rectangle(frame, (0, 0), (w, 60), (0,0,0), -1)
-            cv2.putText(frame, f"  {label}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.3, color, 3)
+            cv2.putText(frame, f"  {display_label}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.3, color, 3)
             cv2.putText(frame, guidance, (20, h-45), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (80,255,200), 2)
             cv2.putText(frame, f"Conf: {conf:.2f}  |  FPS: {avg_fps:.1f}", (20, h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+            snap = get_sensor_snapshot()
+            if not snap.get("enabled", False):
+                tof_text = "ToF front: disabled"
+            elif snap.get("front_mm") is not None:
+                tof_text = f"ToF front: {snap['front_mm']} mm"
+            elif snap.get("error"):
+                tof_text = "ToF front: sensor error"
+            else:
+                tof_text = "ToF front: no valid target"
+            cv2.putText(frame, tof_text, (w - 265, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(frame, f"Pitch: {snap.get('pitch_deg', 0.0):.1f} deg", (w - 265, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            draw_tof_grid(frame, snap)
             queue_speech(speech_text)
             maybe_write_recording(frame)
             _, buffer = cv2.imencode('.jpg', frame)
@@ -569,7 +867,20 @@ def voice_test():
     queue_speech(VOICE_TEST_TEXT)
     return jsonify({"ok": True, "message": f"Queued voice test: {VOICE_TEST_TEXT}"}), 200
 
+
+@app.route('/sensor/status', methods=['GET'])
+def sensor_status():
+    return jsonify({"ok": True, "sensor": get_sensor_snapshot()}), 200
+
 if __name__ == '__main__':
+    if ENABLE_SENSOR_BRIDGE:
+        sensor_thread = threading.Thread(target=_sensor_stream_worker, daemon=True)
+        sensor_thread.start()
+        print(f"[INFO] Sensor bridge: enabled ({SENSOR_STREAM_CMD})")
+    else:
+        with sensor_lock:
+            sensor_state["error"] = "Sensor bridge disabled"
+        print("[INFO] Sensor bridge: disabled")
     print("[INFO] Open browser at http://<raspberry-pi-ip>:5000")
     print("[INFO] Camera source: Picamera2 only")
     if ENABLE_VOICE:
