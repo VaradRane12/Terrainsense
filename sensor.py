@@ -21,6 +21,7 @@ _sensor_lock = threading.Lock()
 _sensor_state: dict = {
     "enabled":     ENABLE_SENSOR_BRIDGE,
     "front_mm":    None,
+    "front_valid_cells": 0,
     "pitch_deg":   0.0,
     "yaw_deg":     0.0,
     "quat":        [1.0, 0.0, 0.0, 0.0],
@@ -53,8 +54,8 @@ def start_sensor_thread() -> threading.Thread | None:
 
 
 # ── Internal helpers ────────────────────────────────────────────────────────
-def _extract_front_mm(distances: list, status: list) -> int | None:
-    """Median of the centre 4×4 cells in the 8×8 ToF grid."""
+def _extract_front_stats(distances: list, status: list) -> tuple[int | None, int]:
+    """Return (median_mm, valid_cells) for the centre 4×4 cells in the 8×8 ToF grid."""
     centre_idxs = [18, 19, 20, 21, 26, 27, 28, 29, 34, 35, 36, 37, 42, 43, 44, 45]
     vals = [
         int(distances[i])
@@ -62,10 +63,12 @@ def _extract_front_mm(distances: list, status: list) -> int | None:
         if i < len(distances) and i < len(status)
         and status[i] == 5 and distances[i] > 0
     ]
-    if not vals:
-        # Fallback: accept any non-zero distance in the centre
-        vals = [int(distances[i]) for i in centre_idxs if i < len(distances) and distances[i] > 0]
-    return int(np.median(vals)) if vals else None
+    return (int(np.median(vals)), len(vals)) if vals else (None, 0)
+
+
+def _extract_front_mm(distances: list, status: list) -> int | None:
+    mm, _ = _extract_front_stats(distances, status)
+    return mm
 
 
 def _quat_to_pitch_deg(quat: list) -> float:
@@ -123,12 +126,13 @@ def _sensor_stream_worker() -> None:
             if len(quat) < 4:
                 quat = [1.0, 0.0, 0.0, 0.0]
 
-            front_mm  = _extract_front_mm(distances, status)
+            front_mm, front_valid_cells = _extract_front_stats(distances, status)
             pitch_deg = _quat_to_pitch_deg(quat)
             yaw_deg   = _quat_to_yaw_deg(quat)
 
             with _sensor_lock:
                 _sensor_state["front_mm"]    = front_mm
+                _sensor_state["front_valid_cells"] = front_valid_cells
                 _sensor_state["pitch_deg"]   = pitch_deg
                 _sensor_state["yaw_deg"]     = yaw_deg
                 _sensor_state["quat"]        = quat

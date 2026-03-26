@@ -14,12 +14,13 @@ Startup sequence
   6. app.run()                          Flask HTTP server
 """
 
-from flask import Flask, Response, jsonify, request
-
+from flask import Flask, Response, jsonify, request, render_template
+import threading
 import camera
 import recording
 import sensor
 import speech
+import app_state
 from config import (
     DEFAULT_RECORD_FPS,
     DEFAULT_RECORD_MINUTES,
@@ -38,47 +39,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return (
-        "<html><body style='background:#111;text-align:center;margin:0;padding:20px;'>"
-        "<h1 style='color:#00ff99;font-family:Arial;'>TerrainSense Live</h1>"
-        "<div style='margin-bottom:12px;color:#d5ffe8;font-family:Arial;'>"
-        "Minutes: <input id='mins' type='number' min='1' value='5' style='width:70px;'>"
-        "<button onclick='startRec()' style='margin-left:8px;padding:8px 12px;'>Start Recording</button>"
-        "<button onclick='stopRec()' style='margin-left:8px;padding:8px 12px;'>Stop</button>"
-        "<button onclick='voiceOn()' style='margin-left:8px;padding:8px 12px;'>Voice ON</button>"
-        "<button onclick='voiceOff()' style='margin-left:8px;padding:8px 12px;'>Voice OFF</button>"
-        "<button onclick='voiceTest()' style='margin-left:8px;padding:8px 12px;'>Voice TEST</button>"
-        "<div id='recStatus' style='margin-top:8px;font-size:14px;'></div>"
-        "<div id='voiceStatus' style='margin-top:4px;font-size:14px;'></div>"
-        "</div>"
-        "<img src='/video_feed' style='width:100%;max-width:860px;border:2px solid #00ff99;border-radius:8px;'>"
-        "<script>"
-        "async function refreshStatus(){"
-        "  const r=await fetch('/record/status');const j=await r.json();"
-        "  document.getElementById('recStatus').textContent=j.recording"
-        "    ?`Recording ON | ${j.seconds_left}s left | File: ${j.saved_to}`:'Recording OFF';"
-        "  const vr=await fetch('/voice/status');const vj=await vr.json();"
-        "  document.getElementById('voiceStatus').textContent=vj.voice_enabled?'Voice ON':'Voice OFF';"
-        "}"
-        "async function startRec(){"
-        "  const m=document.getElementById('mins').value||'5';"
-        "  const r=await fetch(`/record/start?minutes=${encodeURIComponent(m)}`);"
-        "  const j=await r.json();"
-        "  document.getElementById('recStatus').textContent=j.error||('Started: '+j.saved_to);"
-        "}"
-        "async function stopRec(){"
-        "  const r=await fetch('/record/stop');const j=await r.json();"
-        "  document.getElementById('recStatus').textContent=j.saved_to?('Saved: '+j.saved_to):'Stopped';"
-        "}"
-        "async function voiceOn(){await fetch('/voice/on');refreshStatus();}"
-        "async function voiceOff(){await fetch('/voice/off');refreshStatus();}"
-        "async function voiceTest(){"
-        "  const r=await fetch('/voice/test');const j=await r.json();"
-        "  document.getElementById('voiceStatus').textContent=j.message||j.error||'Voice test sent';"
-        "}"
-        "setInterval(refreshStatus,1000);refreshStatus();"
-        "</script></body></html>"
-    )
+    return render_template("index.html")
 
 
 @app.route("/video_feed")
@@ -135,6 +96,39 @@ def voice_test():
     return jsonify({"ok": True, "message": f"Queued voice test: {VOICE_TEST_TEXT}"}), 200
 
 
+@app.route("/audio/output/status", methods=["GET"])
+def audio_output_status():
+    st = speech.get_voice_status()
+    return jsonify({"ok": True, "audio_output": st.get("audio_output", "unknown")}), 200
+
+
+@app.route("/audio/output/bluetooth", methods=["GET", "POST"])
+def audio_output_bluetooth():
+    result = speech.set_audio_output("bluetooth")
+    return jsonify(result), 200 if result.get("ok") else 409
+
+
+@app.route("/audio/output/aux", methods=["GET", "POST"])
+def audio_output_aux():
+    result = speech.set_audio_output("aux")
+    return jsonify(result), 200 if result.get("ok") else 409
+
+
+@app.route("/video/stabilization/status", methods=["GET"])
+def video_stabilization_status():
+    return jsonify(camera.get_stabilization_status()), 200
+
+
+@app.route("/video/stabilization/on", methods=["GET", "POST"])
+def video_stabilization_on():
+    return jsonify(camera.set_stabilization_enabled(True)), 200
+
+
+@app.route("/video/stabilization/off", methods=["GET", "POST"])
+def video_stabilization_off():
+    return jsonify(camera.set_stabilization_enabled(False)), 200
+
+
 # ── Sensor ────────────────────────────────────────────────────────────────────
 
 @app.route("/sensor/status", methods=["GET"])
@@ -142,7 +136,26 @@ def sensor_status():
     return jsonify({"ok": True, "sensor": sensor.get_sensor_snapshot()}), 200
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── App Control ────────────────────────────────────────────────────────────────
+
+@app.route("/app/start", methods=["POST"])
+def app_start():
+    app_state.set_running(True)
+    return jsonify({"ok": True, "message": "App started"}), 200
+
+
+@app.route("/app/stop", methods=["POST"])
+def app_stop():
+    app_state.set_running(False)
+    return jsonify({"ok": True, "message": "App stopped"}), 200
+
+
+@app.route("/app/status", methods=["GET"])
+def app_status():
+    running = app_state.get_running()
+    return jsonify({"ok": True, "running": running}), 200
+
+
 #  ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -165,4 +178,8 @@ if __name__ == "__main__":
     camera.start_pipeline()
 
     print("[INFO] Open browser at  http://<raspberry-pi-ip>:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print("[INFO] Dashboard at http://<raspberry-pi-ip>:5000/")
+    try:
+        app.run(host="0.0.0.0", port=5000, debug=False)
+    except KeyboardInterrupt:
+        print("[INFO] Shutting down...")

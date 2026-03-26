@@ -109,7 +109,8 @@ def maybe_enqueue_frame(frame) -> None:
             return
 
     try:
-        _write_queue.put_nowait(frame.copy())
+            # Include capture timestamp so writer can preserve real-time pacing.
+            _write_queue.put_nowait((time.time(), frame.copy()))
     except queue.Full:
         pass  # drop frame rather than stall inference
 
@@ -183,10 +184,12 @@ def _record_writer_worker() -> None:
     Dedicated thread: owns the cv2.VideoWriter so disk I/O never touches
     the camera/inference thread.
     """
-    writer    = None
-    path      = None
-    fps       = DEFAULT_RECORD_FPS
-    frame_wh  = None
+    writer = None
+    path = None
+    fps = DEFAULT_RECORD_FPS
+    frame_wh = None
+    video_start_ts = None
+    frames_written = 0
 
     while True:
         item = _write_queue.get()
@@ -196,16 +199,18 @@ def _record_writer_worker() -> None:
             if writer is not None:
                 writer.release()
                 writer = None
+                video_start_ts = None
+                frames_written = 0
             _write_queue.task_done()
             continue
 
-        frame = item
+        ts, frame = item
 
         # Lazy-create writer on first frame
         if writer is None:
             with _record_lock:
                 path = _record_state["path"]
-                fps  = _record_state["fps"]
+                fps = _record_state["fps"]
             if path:
                 h, w = frame.shape[:2]
                 frame_wh = (w, h)
@@ -214,9 +219,22 @@ def _record_writer_worker() -> None:
                 if not writer.isOpened():
                     print(f"[ERROR] Could not open video writer: {path}")
                     writer = None
+                else:
+                    video_start_ts = float(ts)
+                    frames_written = 0
 
         if writer is not None:
-            writer.write(frame)
+            # Keep output duration aligned with wall clock by pacing writes to timestamps.
+            if video_start_ts is None:
+                video_start_ts = float(ts)
+            elapsed = max(0.0, float(ts) - float(video_start_ts))
+            target_frames = int(elapsed * float(fps)) + 1
+            if target_frames <= frames_written:
+                target_frames = frames_written + 1
+
+            while frames_written < target_frames:
+                writer.write(frame)
+                frames_written += 1
 
         _write_queue.task_done()
 

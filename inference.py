@@ -20,6 +20,7 @@ import sensor
 from config import (
     CLASS_LABELS,
     CONF_THRESH,
+    DRAW_TOF_GRID,
     FALL_ASPECT_THRESHOLD,
     FALL_HEIGHT_DROP_RATIO,
     IGNORE_FAR_MM,
@@ -31,6 +32,11 @@ from config import (
     NMS_THRESH,
     PERSON_MOVE_PX_PER_SEC,
     TOF_ALERT_MM,
+    TOF_PATH_CONFIRM_TOL_MM,
+    TOF_PATH_MIN_VALID_CELLS,
+    TOF_SPEECH_REQUIRE_PATH,
+    VOICE_MIN_CONF,
+    VOICE_STABLE_FRAMES,
     WALK_CORRIDOR_WIDTH_RATIO,
     YAW_SHIFT_SCALE,
 )
@@ -70,6 +76,11 @@ _person_state: dict = {
     "last_center_x": None,
     "last_height":   None,
     "last_time":     0.0,
+}
+
+_speech_gate_state: dict = {
+    "last_key": "",
+    "streak": 0,
 }
 
 
@@ -129,16 +140,17 @@ def postprocess(output: list, frame: np.ndarray):
 
     if not np.any(mask):
         _handle_no_detection(frame, snap, w_f, h_f, corr_x1, corr_x2)
-        if snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
+        if _tof_front_has_evidence(snap) and snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
             return (None, (0, 165, 255), 0.0,
-                    f"TOF obstacle {snap['front_mm']} mm",
-                    f"Stop. obstacle at {snap['front_mm']} millimeters")
+                    f"TOF obstacle {snap['front_mm']/10:.0f} cm",
+                    f"Stop. obstacle at {snap['front_mm']/10:.0f} centimeters")
         return None, (0, 255, 0), 0.0, "Path clear", None
 
     scale_x = w_f / INPUT_SIZE
     scale_y = h_f / INPUT_SIZE
 
     boxes_xyxy, confs_f, classes_f = [], [], []
+    tof_mm_f, tof_cells_f = [], []
     for i, box in enumerate(preds[:, :4][mask]):
         cx, cy, bw, bh = box
         x1 = max(0,   int((cx - bw / 2) * scale_x))
@@ -148,13 +160,15 @@ def postprocess(output: list, frame: np.ndarray):
 
         if not _is_in_corridor(x1, x2, corr_x1, corr_x2):
             continue
-        obj_mm = _tof_mm_for_bbox(snap, x1, x2, w_f)
+        obj_mm, obj_cells = _tof_path_evidence_for_bbox(snap, x1, x2, w_f)
         if obj_mm is not None and obj_mm > IGNORE_FAR_MM:
             continue
 
         boxes_xyxy.append([x1, y1, x2, y2])
         confs_f.append(float(confidences[mask][i]))
         classes_f.append(int(class_ids[mask][i]))
+        tof_mm_f.append(obj_mm)
+        tof_cells_f.append(obj_cells)
 
     if not boxes_xyxy:
         _handle_no_detection(frame, snap, w_f, h_f, corr_x1, corr_x2)
@@ -164,16 +178,18 @@ def postprocess(output: list, frame: np.ndarray):
     indices   = cv2.dnn.NMSBoxes(boxes_nms, confs_f, CONF_THRESH, NMS_THRESH)
     if len(indices) == 0:
         _handle_no_detection(frame, snap, w_f, h_f, corr_x1, corr_x2)
-        if snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
+        if _tof_front_has_evidence(snap) and snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
             return (None, (0, 165, 255), 0.0,
-                    f"TOF obstacle {snap['front_mm']} mm",
-                    f"Stop. obstacle at {snap['front_mm']} millimeters")
+                    f"TOF obstacle {snap['front_mm']/10:.0f} cm",
+                    f"Stop. obstacle at {snap['front_mm']/10:.0f} centimeters")
         return None, (0, 255, 0), 0.0, "Path clear", None
 
     best_i          = max(indices.flatten(), key=lambda i: confs_f[i])
     x1, y1, x2, y2 = boxes_xyxy[best_i]
     conf            = float(confs_f[best_i])
     label, color    = CLASS_LABELS.get(int(classes_f[best_i]), ("UNKNOWN", (255, 255, 255)))
+    best_tof_mm     = tof_mm_f[best_i] if best_i < len(tof_mm_f) else None
+    best_tof_cells  = tof_cells_f[best_i] if best_i < len(tof_cells_f) else 0
 
     guidance_text, speech_text = _direction_guidance(label, x1, x2, w_f, snap)
 
@@ -190,7 +206,12 @@ def postprocess(output: list, frame: np.ndarray):
     cv2.putText(frame, text, (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
     _draw_osd(frame, snap, w_f, h_f, conf, guidance_text, label, color, corr_x1, corr_x2)
-    return label, color, conf, guidance_text, speech_text
+
+    gated_speech = _gate_speech(label, conf, speech_text)
+    if gated_speech and not _tof_allows_speech(snap, label, best_tof_mm, best_tof_cells, gated_speech):
+        gated_speech = None
+
+    return label, color, conf, guidance_text, gated_speech
 
 
 def draw_tof_grid(frame: np.ndarray, snap: dict) -> None:
@@ -238,22 +259,39 @@ def _tof_cell_color(d_mm: int, st: int) -> tuple:
 
 
 def _tof_mm_for_bbox(snap: dict, x1: int, x2: int, frame_w: int) -> int | None:
+    mm, _ = _tof_path_evidence_for_bbox(snap, x1, x2, frame_w, min_cells=1)
+    if mm is not None:
+        return mm
+    return snap.get("front_mm")
+
+
+def _tof_path_evidence_for_bbox(
+    snap: dict,
+    x1: int,
+    x2: int,
+    frame_w: int,
+    min_cells: int = TOF_PATH_MIN_VALID_CELLS,
+) -> tuple[int | None, int]:
     dists = snap.get("distances", [0] * 64)
     stats = snap.get("status",   [0] * 64)
     c0    = max(0, min(7, int((x1 / max(1, frame_w)) * 8)))
     c1    = max(0, min(7, int((x2 / max(1, frame_w)) * 8)))
     if c1 < c0:
         c0, c1 = c1, c0
+
+    # Focus on middle rows to represent walk-path occupancy and ignore tiny edge noise.
+    focus_rows = (2, 3, 4, 5)
     vals = [
         int(dists[r * 8 + c])
-        for r in range(8)
+        for r in focus_rows
         for c in range(c0, c1 + 1)
         if r * 8 + c < len(dists) and r * 8 + c < len(stats)
         and stats[r * 8 + c] == 5 and dists[r * 8 + c] > 0
     ]
-    if not vals:
-        return snap.get("front_mm")
-    return int(np.median(vals))
+    valid_cells = len(vals)
+    if valid_cells < max(1, int(min_cells)):
+        return None, valid_cells
+    return int(np.median(vals)), valid_cells
 
 
 def _tof_nearest_side(snap: dict) -> tuple[str | None, int | None]:
@@ -304,9 +342,9 @@ def _direction_guidance(label: str, x1: int, x2: int, width: int, snap: dict) ->
         speech_text   = f"Move {move}. {label.lower()} ahead"
 
     if snap.get("front_mm") is not None and snap["front_mm"] < TOF_ALERT_MM:
-        guidance_text = f"{guidance_text} | {snap['front_mm']} mm"
+        guidance_text = f"{guidance_text} | {snap['front_mm']/10:.0f} cm"
         if move == "stop":
-            speech_text = f"Stop. {label.lower()} at {snap['front_mm']} millimeters"
+            speech_text = f"Stop. {label.lower()} at {snap['front_mm']/10:.0f} centimeters"
 
     return guidance_text, speech_text
 
@@ -407,4 +445,95 @@ def _draw_osd(frame, snap, w_f, h_f, conf, guidance, label, color, corr_x1, corr
     cv2.putText(frame, f"Yaw: {snap.get('yaw_deg', 0.0):.1f} deg  Far>{IGNORE_FAR_MM}mm ignored",
                 (20, h_f - 68), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 190, 190), 1)
 
-    draw_tof_grid(frame, snap)
+    if DRAW_TOF_GRID:
+        draw_tof_grid(frame, snap)
+
+
+def _gate_speech(label: str | None, conf: float, speech_text: str | None) -> str | None:
+    """Only allow speech when detection is confident and stable for a few frames."""
+    if not speech_text:
+        return None
+
+    # Always pass critical safety prompts quickly.
+    if _is_critical_speech(speech_text):
+        return speech_text
+
+    # Relax confidence threshold a bit for person-related guidance.
+    min_conf = float(VOICE_MIN_CONF)
+    if label == "PERSON":
+        min_conf = max(0.35, min_conf - 0.10)
+
+    if label and float(conf) < min_conf:
+        _speech_gate_state["last_key"] = ""
+        _speech_gate_state["streak"] = 0
+        return None
+
+    key = f"{label or 'none'}|{speech_text.split('.')[0].strip().lower()}"
+    if key == _speech_gate_state["last_key"]:
+        _speech_gate_state["streak"] += 1
+    else:
+        _speech_gate_state["last_key"] = key
+        _speech_gate_state["streak"] = 1
+
+    stable_frames = max(1, int(VOICE_STABLE_FRAMES))
+    if label == "PERSON":
+        stable_frames = max(1, stable_frames - 1)
+
+    return speech_text if _speech_gate_state["streak"] >= stable_frames else None
+
+
+def _is_critical_speech(speech_text: str) -> bool:
+    t = speech_text.lower()
+    return any(k in t for k in ("stop", "alert", "fall", "obstacle", "assist immediately"))
+
+
+def _tof_allows_speech(
+    snap: dict,
+    label: str | None,
+    tof_mm: int | None,
+    tof_cells: int,
+    speech_text: str,
+) -> bool:
+    if not TOF_SPEECH_REQUIRE_PATH:
+        return True
+
+    front_mm = snap.get("front_mm")
+
+    # Always allow hard-stop ToF alerts when front path is clearly blocked.
+    if (
+        _is_critical_speech(speech_text)
+        and _tof_front_has_evidence(snap)
+        and front_mm is not None
+        and front_mm < TOF_ALERT_MM
+    ):
+        return True
+
+    if tof_mm is None or tof_cells < TOF_PATH_MIN_VALID_CELLS:
+        return False
+
+    # Require rough consistency between bbox ToF slice and front path median.
+    if front_mm is not None and abs(int(tof_mm) - int(front_mm)) > TOF_PATH_CONFIRM_TOL_MM:
+        return False
+
+    # For person/object guidance, require obstacle/person to be in relevant path range.
+    if label and tof_mm > IGNORE_FAR_MM:
+        return False
+
+    return True
+
+
+def _tof_front_has_evidence(snap: dict) -> bool:
+    valid_cells = int(snap.get("front_valid_cells", 0) or 0)
+    if valid_cells >= TOF_PATH_MIN_VALID_CELLS:
+        return True
+
+    # Backward-compatible fallback if sensor snapshot does not yet contain front_valid_cells.
+    dists = snap.get("distances", [0] * 64)
+    stats = snap.get("status", [0] * 64)
+    centre_idxs = [18, 19, 20, 21, 26, 27, 28, 29, 34, 35, 36, 37, 42, 43, 44, 45]
+    count = sum(
+        1
+        for i in centre_idxs
+        if i < len(dists) and i < len(stats) and stats[i] == 5 and dists[i] > 0
+    )
+    return count >= TOF_PATH_MIN_VALID_CELLS
