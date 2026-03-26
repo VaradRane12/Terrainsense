@@ -41,9 +41,9 @@ RECORD_AUDIO_RATE      = int(os.environ.get("RECORD_AUDIO_RATE", "16000"))
 
 # ── Voice ──────────────────────────────────────────────────────────────────
 ENABLE_VOICE       = os.environ.get("ENABLE_VOICE", "1") == "1"
-VOICE_INTERVAL_SEC = float(os.environ.get("VOICE_INTERVAL_SEC", "2.0"))
+VOICE_INTERVAL_SEC = float(os.environ.get("VOICE_INTERVAL_SEC", "1.0"))
 VOICE_MIN_CONF     = float(os.environ.get("VOICE_MIN_CONF", "0.52"))
-VOICE_STABLE_FRAMES = int(os.environ.get("VOICE_STABLE_FRAMES", "2"))
+VOICE_STABLE_FRAMES = int(os.environ.get("VOICE_STABLE_FRAMES", "1"))
 VOICE_RATE         = os.environ.get("VOICE_RATE", "165")
 VOICE_TEST_TEXT    = os.environ.get("VOICE_TEST_TEXT", "Audio test from TerrainSense")
 
@@ -62,11 +62,13 @@ AUDIO_FORCE_AUX_ONLY = os.environ.get("AUDIO_FORCE_AUX_ONLY", "1") == "1"
 # ── Sensor bridge ──────────────────────────────────────────────────────────
 ENABLE_SENSOR_BRIDGE = os.environ.get("ENABLE_SENSOR_BRIDGE", "1") == "1"
 SENSOR_STREAM_CMD    = os.environ.get("SENSOR_STREAM_CMD", "python sensor_stream.py")
-TOF_ALERT_MM         = int(os.environ.get("TOF_ALERT_MM", "900"))
-IGNORE_FAR_MM        = int(os.environ.get("IGNORE_FAR_MM", "2200"))
-TOF_PATH_MIN_VALID_CELLS = int(os.environ.get("TOF_PATH_MIN_VALID_CELLS", "4"))
-TOF_PATH_CONFIRM_TOL_MM  = int(os.environ.get("TOF_PATH_CONFIRM_TOL_MM", "700"))
-TOF_SPEECH_REQUIRE_PATH  = os.environ.get("TOF_SPEECH_REQUIRE_PATH", "1") == "1"
+TOF_ALERT_MM         = int(os.environ.get("TOF_ALERT_MM", "1200"))
+IGNORE_FAR_MM        = int(os.environ.get("IGNORE_FAR_MM", "9000"))
+TOF_PATH_MIN_VALID_CELLS = int(os.environ.get("TOF_PATH_MIN_VALID_CELLS", "2"))
+TOF_PATH_CONFIRM_TOL_MM  = int(os.environ.get("TOF_PATH_CONFIRM_TOL_MM", "1400"))
+TOF_SPEECH_REQUIRE_PATH  = os.environ.get("TOF_SPEECH_REQUIRE_PATH", "0") == "1"
+TOF_ROTATE_180           = os.environ.get("TOF_ROTATE_180", "1") == "1"
+TOF_FRONT_PERCENTILE     = float(os.environ.get("TOF_FRONT_PERCENTILE", "30"))
 
 # ── Person / fall detection ────────────────────────────────────────────────
 PERSON_MOVE_PX_PER_SEC  = float(os.environ.get("PERSON_MOVE_PX_PER_SEC", "45.0"))

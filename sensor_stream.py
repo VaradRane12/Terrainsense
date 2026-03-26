@@ -83,7 +83,8 @@ try:
             except Exception as e:
                 print(f"[SENSOR_STREAM] ToF read error: {e}", file=sys.stderr, flush=True)
 
-        time.sleep(0.01)
+        # Keep latency low; ToF data_ready() gates real update rate.
+        time.sleep(0.005)
 
 except KeyboardInterrupt:
     print("[SENSOR_STREAM] Shutting down...", file=sys.stderr, flush=True)

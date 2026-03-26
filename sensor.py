@@ -14,7 +14,12 @@ import time
 
 import numpy as np
 
-from config import ENABLE_SENSOR_BRIDGE, SENSOR_STREAM_CMD
+from config import (
+    ENABLE_SENSOR_BRIDGE,
+    SENSOR_STREAM_CMD,
+    TOF_FRONT_PERCENTILE,
+    TOF_ROTATE_180,
+)
 
 # ── Shared state ────────────────────────────────────────────────────────────
 _sensor_lock = threading.Lock()
@@ -63,12 +68,23 @@ def _extract_front_stats(distances: list, status: list) -> tuple[int | None, int
         if i < len(distances) and i < len(status)
         and status[i] == 5 and distances[i] > 0
     ]
-    return (int(np.median(vals)), len(vals)) if vals else (None, 0)
+    if not vals:
+        return (None, 0)
+
+    pct = float(max(0.0, min(100.0, TOF_FRONT_PERCENTILE)))
+    return (int(np.percentile(vals, pct)), len(vals))
 
 
 def _extract_front_mm(distances: list, status: list) -> int | None:
     mm, _ = _extract_front_stats(distances, status)
     return mm
+
+
+def _rotate_grid_180(values: list) -> list:
+    """Rotate flattened 8x8 grid by 180 degrees to align sensor and camera orientation."""
+    if len(values) < 64:
+        values = list(values) + [0] * (64 - len(values))
+    return list(values[:64])[::-1]
 
 
 def _quat_to_pitch_deg(quat: list) -> float:
@@ -125,6 +141,10 @@ def _sensor_stream_worker() -> None:
             status    += [0] * (64 - len(status))
             if len(quat) < 4:
                 quat = [1.0, 0.0, 0.0, 0.0]
+
+            if TOF_ROTATE_180:
+                distances = _rotate_grid_180(distances)
+                status = _rotate_grid_180(status)
 
             front_mm, front_valid_cells = _extract_front_stats(distances, status)
             pitch_deg = _quat_to_pitch_deg(quat)

@@ -6,3 +6,5 @@ pyenv311
 __pycache__
 walk_test.mp4
 ._*
+*.wav
+*.mp4
