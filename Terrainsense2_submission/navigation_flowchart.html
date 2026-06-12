@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Navigation Guidance Flowchart</title>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, themeVariables: { fontSize: '24px', fontFamily: 'sans-serif' } });
+    </script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background-color: #f4f4f9; }
+        .mermaid { display: flex; justify-content: center; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <h2 style="text-align: center;">TerrainSense Navigation Guidance (Simplified)</h2>
+    <div class="mermaid">
+        flowchart TD
+            A([Start: New Frame & Sensor Data]) --> B[Filter Objects by Walking Corridor & ToF Distance]
+            B --> C{Any valid objects?}
+            
+            %% No Object Flow
+            C -- No --> D{ToF Front Obstacle?}
+            D -- Yes --> Alert[/"Alert: 'Stop, obstacle'"/]
+            D -- No --> Clear[/"Status: 'Path clear'"/]
+            
+            %% Object Found Flow
+            C -- Yes --> E[Select Most Confident Object]
+            E --> F{Object Position}
+            
+            F -- "Left Side" --> MoveRight["Guidance: Move Right"]
+            F -- "Right Side" --> MoveLeft["Guidance: Move Left"]
+            F -- "Center" --> Stop["Guidance: Stop"]
+            
+            MoveRight & MoveLeft & Stop --> G{Is it a Person?}
+            
+            %% Person & Speech Flow
+            G -- Yes --> FallCheck[Check Person Motion & Fall Risk]
+            G -- No --> SpeechGate
+            FallCheck --> SpeechGate[Speech Gating & ToF Confirmation]
+            
+            SpeechGate --> Output[/"Output Voice Guidance"/]
+            
+            Alert & Clear & Output --> End([Render OSD & Return])
+
+            %% Styling
+            classDef startend fill:#1e1e1e,stroke:#333,stroke-width:2px,color:#fff;
+            classDef process fill:#1e3a5f,stroke:#2b5284,stroke-width:2px,color:#fff;
+            classDef check fill:#2d4a22,stroke:#4a7a37,stroke-width:2px,color:#fff;
+            classDef speech fill:#5f2c2c,stroke:#843b3b,stroke-width:2px,color:#fff;
+
+            class A,End startend;
+            class B,E,FallCheck process;
+            class C,D,F,G,SpeechGate check;
+            class Alert,Clear,MoveRight,MoveLeft,Stop,Output speech;
+    </div>
+</body>
+</html>

@@ -1,0 +1,42 @@
+{
+  "dataset_root": "terrain_dataset",
+  "database_path": "terrain_dataset.sqlite",
+  "splits": {
+    "train": {
+      "images": 2303,
+      "label_files": 2303,
+      "annotations": 9528
+    },
+    "valid": {
+      "images": 288,
+      "label_files": 288,
+      "annotations": 1194
+    },
+    "test": {
+      "images": 291,
+      "label_files": 291,
+      "annotations": 1119
+    }
+  },
+  "classes": {
+    "0": "obstacle",
+    "1": "person",
+    "2": "pothole",
+    "3": "vehical"
+  },
+  "class_annotation_counts": {
+    "obstacle": 7369,
+    "person": 2244,
+    "pothole": 748,
+    "vehical": 1480
+  },
+  "image_summary": {
+    "count": 2882,
+    "missing_label_images": 0,
+    "width_min": 640,
+    "width_max": 1080,
+    "height_min": 640,
+    "height_max": 1920
+  },
+  "missing_label_images": []
+}
