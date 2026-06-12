@@ -1,5 +1,10 @@
 # TerrainSense — Multithreaded Refactor
 
+## Data Labelling & Model Training
+The code and scripts used for data labelling, dataset preprocessing, and model retraining can be found in two places:
+1. Inside the `data_labelling_branch/` folder included directly in this directory.
+2. On the dedicated `data_labelling` branch of the GitHub repository.
+
 ## File layout
 
 ```
